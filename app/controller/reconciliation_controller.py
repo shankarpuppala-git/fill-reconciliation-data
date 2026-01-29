@@ -16,7 +16,7 @@ async def run_reconciliation(
     current_batch_csv: UploadFile = File(None),
     settled_batch_csv: UploadFile = File(None)
 ):
-   logger = None
+    logger = None
     try:
          logger = GoogleDocsLogger(
          folder_id=LOG_FOLDER_ID,

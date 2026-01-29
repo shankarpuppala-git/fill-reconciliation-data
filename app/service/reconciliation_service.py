@@ -5,34 +5,39 @@ from io import TextIOWrapper
 from app.common import db_queries
 from app.sheets.sheets_writer import GoogleSheetsWriter
 
+def safe_log(logger, level, message):
+    if logger:
+        logger.log(level, message)
+    else:
+        print(f"[{level}] {message}")
 
 class ReconciliationService:
 
     # ================= DB QUERIES =================
     @staticmethod
     def run_db_reconciliation(business_date: str, logger):
-        logger.log("INFO", f"Starting DB reconciliation for date {business_date}")
+        safe_log(logger,"INFO", f"Starting DB reconciliation for date {business_date}")
 
-        logger.log("INFO", "Running Query-1: Sales Orders")
+        safe_log(logger,"INFO", "Running Query-1: Sales Orders")
         sales_orders = db_queries.fetch_sales_orders(business_date)
-        logger.log("INFO", f"Query-1 completed | rows={len(sales_orders)}")
+        safe_log(logger,"INFO", f"Query-1 completed | rows={len(sales_orders)}")
 
-        logger.log("INFO", "Running Query-2: Order Items")
+        safe_log(logger,"INFO", "Running Query-2: Order Items")
         order_items = db_queries.fetch_order_items(business_date)
-        logger.log("INFO", f"Query-2 completed | rows={len(order_items)}")
+        safe_log(logger,"INFO", f"Query-2 completed | rows={len(order_items)}")
 
-        logger.log("INFO", "Running Query-3: ASN Process Numbers")
+        safe_log(logger,"INFO", "Running Query-3: ASN Process Numbers")
         asn_rows = db_queries.fetch_asn_process_numbers(business_date)
         process_numbers = [row["process_number"] for row in asn_rows]
-        logger.log("INFO", f"Query-3 completed | rows={len(process_numbers)}")
+        safe_log(logger,"INFO", f"Query-3 completed | rows={len(process_numbers)}")
 
         order_totals = []
         if process_numbers:
-            logger.log("INFO", "Running Query-4: Order Totals")
+            safe_log(logger,"INFO", "Running Query-4: Order Totals")
             order_totals = db_queries.fetch_order_totals(process_numbers)
-            logger.log("INFO", f"Query-4 completed | rows={len(order_totals)}")
+            safe_log(logger,"INFO", f"Query-4 completed | rows={len(order_totals)}")
         else:
-            logger.log("WARN", "Query-4 skipped (no ASN process numbers)")
+            safe_log(logger,"WARN", "Query-4 skipped (no ASN process numbers)")
 
         return {
             "sales_orders": sales_orders,
@@ -57,7 +62,7 @@ class ReconciliationService:
 
         # ---------- CURRENTBATCHES → Converge ----------
         if current_csv:
-            logger.log("INFO", "Processing CURRENTBATCHES CSV")
+            safe_log(logger,"INFO", "Processing CURRENTBATCHES CSV")
 
             converge_rows = []
             csv_reader = csv.DictReader(
@@ -71,14 +76,14 @@ class ReconciliationService:
                 txn_date = row.get("Transaction Date", "").strip()
 
                 if not invoice:
-                    logger.log(
+                    safe_log(logger,
                         "WARN",
                         f"CURRENTBATCHES: Skipping row {row_num} (missing Invoice Number)"
                     )
                     continue
 
                 if txn_date and not (auth_msg or customer):
-                    logger.log(
+                    safe_log(logger,
                         "WARN",
                         f"CURRENTBATCHES: Skipping row {row_num} (only Transaction Date present)"
                     )
@@ -94,16 +99,16 @@ class ReconciliationService:
             if converge_rows:
                 converge_sheet = f"Converge {date_suffix}"
                 writer.write_block(converge_sheet, 2, 1, converge_rows)
-                logger.log(
+                safe_log(logger,
                     "INFO",
                     f"Wrote {len(converge_rows)} rows to {converge_sheet}"
                 )
             else:
-                logger.log("WARN", "No valid rows found in CURRENTBATCHES CSV")
+                safe_log(logger,"WARN", "No valid rows found in CURRENTBATCHES CSV")
 
         # ---------- SETTLEDBATCHES → Converge Settled ----------
         if settled_csv:
-            logger.log("INFO", "Processing SETTLEDBATCHES CSV")
+            safe_log(logger,"INFO", "Processing SETTLEDBATCHES CSV")
 
             settled_rows = []
             csv_reader = csv.DictReader(
@@ -115,7 +120,7 @@ class ReconciliationService:
                 amount = row.get("Original Amount", "").strip()
 
                 if not invoice:
-                    logger.log(
+                    safe_log(logger,
                         "WARN",
                         f"SETTLEDBATCHES: Skipping row {row_num} (missing Invoice Number)"
                     )
@@ -126,12 +131,12 @@ class ReconciliationService:
             if settled_rows:
                 settled_sheet = f"Converge Settled {date_suffix}"
                 writer.write_block(settled_sheet, 2, 1, settled_rows)
-                logger.log(
+                safe_log(logger,
                     "INFO",
                     f"Wrote {len(settled_rows)} rows to {settled_sheet}"
                 )
             else:
-                logger.log("WARN", "No valid rows found in SETTLEDBATCHES CSV")
+                safe_log(logger,"WARN", "No valid rows found in SETTLEDBATCHES CSV")
 
     # ================= WRITE DB DATA TO SHEETS =================
     @staticmethod
@@ -141,7 +146,7 @@ class ReconciliationService:
         business_date: str,
         logger
     ):
-        logger.log("INFO", "Writing DB results to Google Sheets")
+        safe_log(logger,"INFO", "Writing DB results to Google Sheets")
 
         writer = GoogleSheetsWriter(
             spreadsheet_id=spreadsheet_id,
@@ -197,4 +202,4 @@ class ReconciliationService:
         ]
         writer.write_block(shipped_sheet, 2, 5, q4_data)
 
-        logger.log("INFO", "DB results written to Google Sheets successfully")
+        safe_log(logger,"INFO", "DB results written to Google Sheets successfully")

@@ -11,7 +11,7 @@ def fetch_sales_orders(business_date):
             order_state,
             pso.notify_mobile_no,
             pso.payment_reference_no
-        FROM pzv_sales_order pso
+        FROM pzv_aftermarket.pzv_sales_order pso
         WHERE created_on > DATE %s
           AND process_number ILIKE 'CXCL%%'
         ORDER BY order_date DESC
@@ -32,10 +32,10 @@ def fetch_order_items(business_date):
         SELECT
             order_process_number,
             order_status
-        FROM pzv_sales_order_item
+        FROM pzv_aftermarket.pzv_sales_order_item
         WHERE order_process_number IN (
             SELECT process_number
-            FROM pzv_sales_order pso
+            FROM pzv_aftermarket.pzv_sales_order pso
             WHERE created_on > DATE %s
               AND process_number ILIKE 'CXCL%%'
         )
@@ -55,7 +55,7 @@ def fetch_asn_process_numbers(business_date):
     sql = """
         SELECT DISTINCT
             process_number
-        FROM asn_request_log arl
+        FROM pzv_aftermarket.asn_request_log arl
         WHERE arl.created_on > DATE %s
     """
 
@@ -79,7 +79,7 @@ def fetch_order_totals(process_numbers):
         SELECT
             process_number,
             order_total
-        FROM pzv_sales_order pso
+        FROM pzv_aftermarket.pzv_sales_order pso
         WHERE process_number IN ({placeholders})
     """
 
