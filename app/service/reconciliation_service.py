@@ -1,5 +1,6 @@
 from datetime import datetime
 import csv
+import io
 from io import TextIOWrapper
 from collections import defaultdict
 
@@ -68,7 +69,9 @@ class ReconciliationService:
         if current_csv:
             safe_log(logger, "INFO", "Processing CURRENTBATCHES CSV")
 
-            reader = csv.DictReader(TextIOWrapper(current_csv.file, encoding="utf-8"))
+            current_csv.file.seek(0)
+            content = current_csv.file.read().decode("utf-8")
+            reader = csv.DictReader(io.StringIO(content))
 
             for row_num, row in enumerate(reader, start=2):
                 csv_summary["current_batches"]["total_rows"] += 1
@@ -100,7 +103,9 @@ class ReconciliationService:
             safe_log(logger, "INFO", "Processing SETTLEDBATCHES CSV")
 
             txn_type_map = defaultdict(int)
-            reader = csv.DictReader(TextIOWrapper(settled_csv.file, encoding="utf-8"))
+            settled_csv.file.seek(0)
+            content = settled_csv.file.read().decode("utf-8")
+            reader = csv.DictReader(io.StringIO(content))
 
             for row_num, row in enumerate(reader, start=2):
                 csv_summary["settled_batches"]["total_rows"] += 1
