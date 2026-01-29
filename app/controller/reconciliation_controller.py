@@ -16,13 +16,22 @@ async def run_reconciliation(
     current_batch_csv: UploadFile = File(None),
     settled_batch_csv: UploadFile = File(None)
 ):
-    logger = GoogleDocsLogger(
-        folder_id=LOG_FOLDER_ID,
-        service_account_file=SERVICE_ACCOUNT_FILE
-    )
+   logger = None
+    try:
+         logger = GoogleDocsLogger(
+         folder_id=LOG_FOLDER_ID,
+         service_account_file=SERVICE_ACCOUNT_FILE
+         )
+    except Exception as e:
+         print("⚠️ GoogleDocsLogger disabled for UAT:", e)
+ 
+
+
+    
 
     try:
-        logger.log("INFO", "Reconciliation API triggered")
+        if logger:
+             logger.log("INFO", "Reconciliation API triggered")
 
         # -------- DB QUERIES --------
         reconciliation_data = ReconciliationService.run_db_reconciliation(
@@ -50,8 +59,8 @@ async def run_reconciliation(
             date_suffix=date_suffix,
             logger=logger
         )
-
-        logger.log("INFO", "Reconciliation completed successfully")
+        if logger:
+         logger.log("INFO", "Reconciliation completed successfully")
 
         return {
             "status": "SUCCESS",
