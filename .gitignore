@@ -16,3 +16,6 @@ service_account.json
 
 # OS files
 .DS_Store
+
+#env file
+.env
