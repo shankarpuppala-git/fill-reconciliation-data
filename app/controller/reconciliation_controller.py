@@ -1,7 +1,8 @@
 from fastapi import APIRouter, Form, UploadFile, File
+from datetime import datetime
+
 from app.service.reconciliation_service import ReconciliationService
 from app.common.logger import GoogleDocsLogger
-from datetime import datetime
 
 router = APIRouter()
 
@@ -17,21 +18,19 @@ async def run_reconciliation(
     settled_batch_csv: UploadFile = File(None)
 ):
     logger = None
+
+    # -------- LOGGER (FEATURE FLAGGED FOR UAT) --------
     try:
-         logger = GoogleDocsLogger(
-         folder_id=LOG_FOLDER_ID,
-         service_account_file=SERVICE_ACCOUNT_FILE
-         )
+        logger = GoogleDocsLogger(
+            folder_id=LOG_FOLDER_ID,
+            service_account_file=SERVICE_ACCOUNT_FILE
+        )
     except Exception as e:
-         print("⚠️ GoogleDocsLogger disabled for UAT:", e)
- 
-
-
-    
+        print("⚠️ GoogleDocsLogger disabled for UAT:", e)
 
     try:
         if logger:
-             logger.log("INFO", "Reconciliation API triggered")
+            logger.log("INFO", "Reconciliation API triggered")
 
         # -------- DB QUERIES --------
         reconciliation_data = ReconciliationService.run_db_reconciliation(
@@ -39,28 +38,16 @@ async def run_reconciliation(
             logger=logger
         )
 
-        # -------- WRITE DB DATA TO SHEETS --------
-        ReconciliationService.write_db_results_to_sheets(
-            reconciliation_data=reconciliation_data,
-            spreadsheet_id=SPREADSHEET_ID,
-            business_date=business_date,
-            logger=logger
-        )
-
-        # -------- CSV PROCESSING --------
-        date_suffix = datetime.strptime(
-            business_date, "%Y-%m-%d"
-        ).strftime("%m/%d")
-
-        ReconciliationService.process_converge_csvs(
-            current_csv=current_batch_csv,
-            settled_csv=settled_batch_csv,
-            spreadsheet_id=SPREADSHEET_ID,
-            date_suffix=date_suffix,
-            logger=logger
-        )
+        # -------- WRITE DB DATA TO SHEETS (DISABLED IN UAT) --------
         if logger:
-         logger.log("INFO", "Reconciliation completed successfully")
+            ReconciliationService.write_db_results_to_sheets(
+                reconciliation_data=reconciliation_data,
+                spreadsheet_id=SPREADSHEET_ID,
+                business_date=business_date,
+                logger=logger
+            )
+        else:
+            print("[INFO] Skipping Google Sheets write (UAT mode)")
 
         return {
             "status": "SUCCESS",
@@ -68,5 +55,8 @@ async def run_reconciliation(
         }
 
     except Exception as e:
-        logger.log("ERROR", str(e))
+        if logger:
+            logger.log("ERROR", str(e))
+        else:
+            print("[ERROR]", str(e))
         raise
