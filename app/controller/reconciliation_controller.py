@@ -32,13 +32,26 @@ async def run_reconciliation(
         if logger:
             logger.log("INFO", "Reconciliation API triggered")
 
-        # -------- DB QUERIES --------
+        # ================= DB RECONCILIATION =================
         reconciliation_data = ReconciliationService.run_db_reconciliation(
             business_date=business_date,
             logger=logger
         )
 
-        # -------- WRITE DB DATA TO SHEETS (DISABLED IN UAT) --------
+        # ================= CSV PROCESSING =================
+        csv_summary = ReconciliationService.process_converge_csvs(
+            current_csv=current_batch_csv,
+            settled_csv=settled_batch_csv,
+            logger=logger
+        )
+
+        # ================= RECONCILIATION LOGIC =================
+        reconciliation_result = ReconciliationService.reconcile_shipped_vs_settled(
+            reconciliation_data["asn_process_numbers"],
+            csv_summary["settled_batches"]["transaction_type_breakdown"]
+        )
+
+        # ================= GOOGLE SHEETS (DISABLED IN UAT) =================
         if logger:
             ReconciliationService.write_db_results_to_sheets(
                 reconciliation_data=reconciliation_data,
@@ -49,10 +62,26 @@ async def run_reconciliation(
         else:
             print("[INFO] Skipping Google Sheets write (UAT mode)")
 
-        return {
+        # ================= FINAL RESPONSE =================
+        response = {
             "status": "SUCCESS",
-            "business_date": business_date
+            "business_date": business_date,
+
+            "db_summary": {
+                "orders_shipped": len(reconciliation_data["asn_process_numbers"])
+            },
+
+            "Converge_summary": csv_summary,
+
+            "reconciliation": reconciliation_result,
+
+            "google_sheets_write": "SKIPPED (UAT mode)"
         }
+
+        if logger:
+            logger.log("INFO", f"Reconciliation completed: {response['reconciliation']}")
+
+        return response
 
     except Exception as e:
         if logger:
