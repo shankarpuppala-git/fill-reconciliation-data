@@ -1,7 +1,8 @@
 from fastapi import APIRouter, Form, UploadFile, File
 
 from app.service.reconciliation_service import ReconciliationService
-
+from fastapi.responses import StreamingResponse
+from datetime import datetime
 
 router = APIRouter()
 
@@ -21,6 +22,13 @@ async def run_reconciliation(
 
     reconciliation_result = ReconciliationService.reconcile_shipped_vs_settled(reconciliation_data["asn_process_numbers"],csv_summary["settled_batches"]["transaction_type_breakdown"])
 
+    # Excel generation
+    excel_bytes = ReconciliationService.generate_reconciliation_workbook(
+        business_date=business_date,
+        reconciliation_data=reconciliation_data,
+        csv_summary=csv_summary
+    )
+    filename = f"Reconciliation_{business_date}.xlsx"
     response = {
         "status": "SUCCESS",
         "business_date": business_date,
@@ -38,6 +46,12 @@ async def run_reconciliation(
     if logger:
         logger.log("INFO", f"Reconciliation completed: {response['reconciliation']}")
 
-    return response
+    return StreamingResponse(
+        excel_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"'
+        }
+    )
 
 

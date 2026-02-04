@@ -5,6 +5,8 @@ from io import TextIOWrapper
 from collections import defaultdict
 
 from app.common import db_queries
+from app.sheets.workbook_writer import ReconciliationWorkbookWriter
+
 
 
 
@@ -57,11 +59,13 @@ class ReconciliationService:
             "current_batches": {
                 "total_rows": 0,
                 "valid_rows": 0,
-                "skipped_rows": 0
+                "skipped_rows": 0,
+                "rows":[]
             },
             "settled_batches": {
                 "total_rows": 0,
-                "transaction_type_breakdown": {}
+                "transaction_type_breakdown": {},
+                "rows":[]
             }
         }
 
@@ -91,6 +95,12 @@ class ReconciliationService:
                     continue
 
                 csv_summary["current_batches"]["valid_rows"] += 1
+                csv_summary["current_batches"]["rows"].append({
+                    "invoice": invoice,
+                    "auth_message": auth_msg,
+                    "customer": customer,
+                    "transaction_date": txn_date
+                })
 
             safe_log(
                 logger,
@@ -111,11 +121,20 @@ class ReconciliationService:
                 csv_summary["settled_batches"]["total_rows"] += 1
 
                 txn_type = row.get("Original Transaction Type", "").strip().upper()
+                amount = row.get("Original Amount", "").strip()
+                invoice = row.get("Invoice Number", "").strip()
+
+                txn_type = row.get("Original Transaction Type", "").strip().upper()
                 if not txn_type:
                     txn_type = "UNKNOWN"
 
                 txn_type_map[txn_type] += 1
 
+                csv_summary["settled_batches"]["rows"].append({
+                    "invoice": invoice,
+                    "transaction_type": txn_type,
+                    "amount": amount
+                })
             csv_summary["settled_batches"]["transaction_type_breakdown"] = dict(txn_type_map)
 
             safe_log(
@@ -123,6 +142,7 @@ class ReconciliationService:
                 "INFO",
                 f"SETTLEDBATCHES summary: {csv_summary['settled_batches']}"
             )
+
 
         return csv_summary
 
@@ -161,3 +181,36 @@ class ReconciliationService:
                 f"{diff} extra settlements found"
             )
         }
+
+    @staticmethod
+    def generate_reconciliation_workbook(
+            business_date: str,
+            reconciliation_data: dict,
+            csv_summary: dict
+    ):
+        writer = ReconciliationWorkbookWriter(business_date)
+
+        # Sheet 1: CXP
+        writer.create_cxp_sheet(
+            sales_orders=reconciliation_data["sales_orders"],
+            order_items=reconciliation_data["order_items"]
+        )
+
+        # Sheet 2: Converge
+        writer.create_converge_sheet(
+            converge_rows=csv_summary["current_batches"]["rows"]
+        )
+
+        # Sheet 3: Converge Settled
+        writer.create_converge_settled_sheet(
+            settled_rows=csv_summary["settled_batches"]["rows"]
+        )
+
+        # Sheet 4: Orders Shipped
+        writer.create_orders_shipped_sheet(
+            shipped_numbers=reconciliation_data["asn_process_numbers"]
+        )
+
+
+
+        return writer.to_bytes()
