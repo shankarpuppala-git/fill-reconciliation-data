@@ -5,7 +5,7 @@ from io import TextIOWrapper
 from collections import defaultdict
 
 from app.common import db_queries
-from app.sheets.sheets_writer import GoogleSheetsWriter
+
 
 
 def safe_log(logger, level, message):
@@ -19,7 +19,7 @@ class ReconciliationService:
 
     # ================= DB QUERIES =================
     @staticmethod
-    def run_db_reconciliation(business_date: str, logger):
+    def run_db_queries(business_date: str, logger):
         safe_log(logger, "INFO", f"Starting DB reconciliation for date {business_date}")
 
         safe_log(logger, "INFO", "Running Query-1: Sales Orders")
@@ -52,7 +52,7 @@ class ReconciliationService:
 
     # ================= CSV PROCESSING =================
     @staticmethod
-    def process_converge_csvs(current_csv, settled_csv, logger):
+    def process_converge_files(current_csv, settled_csv, logger):
         csv_summary = {
             "current_batches": {
                 "total_rows": 0,
