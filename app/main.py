@@ -1,8 +1,11 @@
 from fastapi import FastAPI
 from dotenv import load_dotenv
+from app.common.logger import setup_logging
 
 # Load environment variables from .env file
 load_dotenv()
+setup_logging()
+
 
 from app.controller.reconciliation_controller import router
 

@@ -66,7 +66,7 @@ class ReconciliationWorkbookWriter:
         sheet = self.workbook.create_sheet("Converge Settled")
 
         headers = [
-            "Invoice Number", "Original Amount", "Original Transaction Type"
+            "Invoice Number", "Original Amount","Transaction Status", "Original Transaction Type"
         ]
         sheet.append(headers)
 

@@ -22,28 +22,28 @@ class ReconciliationService:
     # ================= DB QUERIES =================
     @staticmethod
     def run_db_queries(business_date: str, logger):
-        safe_log(logger, "INFO", f"Starting DB reconciliation for date {business_date}")
+        logger.info(f"Starting DB reconciliation for date {business_date}")
 
-        safe_log(logger, "INFO", "Running Query-1: Sales Orders")
+        logger.info("Running Query-1: Sales Orders")
         sales_orders = db_queries.fetch_sales_orders(business_date)
-        safe_log(logger, "INFO", f"Query-1 completed | rows={len(sales_orders)}")
+        logger.info( f"Query-1 completed | rows={len(sales_orders)}")
 
-        safe_log(logger, "INFO", "Running Query-2: Order Items")
+        logger.info("Running Query-2: Order Items")
         order_items = db_queries.fetch_order_items(business_date)
-        safe_log(logger, "INFO", f"Query-2 completed | rows={len(order_items)}")
+        logger.info( f"Query-2 completed | rows={len(order_items)}")
 
-        safe_log(logger, "INFO", "Running Query-3: ASN Process Numbers")
+        logger.info( "Running Query-3: ASN Process Numbers")
         asn_rows = db_queries.fetch_asn_process_numbers(business_date)
         process_numbers = [row["process_number"] for row in asn_rows]
-        safe_log(logger, "INFO", f"Query-3 completed | rows={len(process_numbers)}")
+        logger.info( f"Query-3 completed | rows={len(process_numbers)}")
 
         order_totals = []
         if process_numbers:
-            safe_log(logger, "INFO", "Running Query-4: Order Totals")
+            logger.info( "Running Query-4: Order Totals")
             order_totals = db_queries.fetch_order_totals(process_numbers)
-            safe_log(logger, "INFO", f"Query-4 completed | rows={len(order_totals)}")
+            logger.info( f"Query-4 completed | rows={len(order_totals)}")
         else:
-            safe_log(logger, "WARN", "Query-4 skipped (no ASN process numbers)")
+            logger.warning( "Query-4 skipped (no ASN process numbers)")
 
         return {
             "sales_orders": sales_orders,
@@ -71,7 +71,7 @@ class ReconciliationService:
 
         # ---------- CURRENTBATCHES ----------
         if current_csv:
-            safe_log(logger, "INFO", "Processing CURRENTBATCHES CSV")
+            logger.info( "Processing CURRENTBATCHES CSV")
 
             current_csv.file.seek(0)
             content = current_csv.file.read().decode("utf-8")
@@ -87,11 +87,7 @@ class ReconciliationService:
 
                 if not invoice or (txn_date and not (auth_msg or customer)):
                     csv_summary["current_batches"]["skipped_rows"] += 1
-                    safe_log(
-                        logger,
-                        "WARN",
-                        f"CURRENTBATCHES: Skipping row {row_num}"
-                    )
+                    logger.warn(f"CURRENTBATCHES: Skipping row {row_num}")
                     continue
 
                 csv_summary["current_batches"]["valid_rows"] += 1
@@ -102,15 +98,11 @@ class ReconciliationService:
                     "transaction_date": txn_date
                 })
 
-            safe_log(
-                logger,
-                "INFO",
-                f"CURRENTBATCHES summary: {csv_summary['current_batches']}"
-            )
+            logger.info(f"CURRENTBATCHES summary: {csv_summary['current_batches']}")
 
         # ---------- SETTLEDBATCHES ----------
         if settled_csv:
-            safe_log(logger, "INFO", "Processing SETTLEDBATCHES CSV")
+            logger.info("Processing SETTLEDBATCHES CSV")
 
             txn_type_map = defaultdict(int)
             settled_csv.file.seek(0)
@@ -137,14 +129,11 @@ class ReconciliationService:
                 })
             csv_summary["settled_batches"]["transaction_type_breakdown"] = dict(txn_type_map)
 
-            safe_log(
-                logger,
-                "INFO",
-                f"SETTLEDBATCHES summary: {csv_summary['settled_batches']}"
-            )
+            logger.info(f"SETTLEDBATCHES summary: {csv_summary['settled_batches']}");
 
 
         return csv_summary
+
 
     # ================= RECONCILIATION LOGIC =================
     @staticmethod
