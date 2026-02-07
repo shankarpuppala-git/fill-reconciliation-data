@@ -1,9 +1,9 @@
 from contextlib import contextmanager
-
+from typing import Optional
 from psycopg2.pool import SimpleConnectionPool
 import os
 
-_pool: SimpleConnectionPool | None = None
+_pool: Optional[SimpleConnectionPool] = None
 
 def init_pool():
     global _pool
