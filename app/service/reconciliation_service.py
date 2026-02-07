@@ -5,7 +5,11 @@ from io import TextIOWrapper
 from collections import defaultdict
 
 from app.common import db_queries
-from app.sheets.sheets_writer import GoogleSheetsWriter
+from app.db.db_client import get_db_connection
+from app.sheets.workbook_writer import ReconciliationWorkbookWriter
+
+
+
 
 
 def safe_log(logger, level, message):
@@ -19,29 +23,30 @@ class ReconciliationService:
 
     # ================= DB QUERIES =================
     @staticmethod
-    def run_db_reconciliation(business_date: str, logger):
-        safe_log(logger, "INFO", f"Starting DB reconciliation for date {business_date}")
+    def run_db_queries(business_date: str, logger):
+        logger.info(f"Starting DB reconciliation for date {business_date}")
 
-        safe_log(logger, "INFO", "Running Query-1: Sales Orders")
+        logger.info("Running Query-1: Sales Orders")
         sales_orders = db_queries.fetch_sales_orders(business_date)
-        safe_log(logger, "INFO", f"Query-1 completed | rows={len(sales_orders)}")
+        logger.info( f"Query-1 completed | rows={len(sales_orders)}")
 
-        safe_log(logger, "INFO", "Running Query-2: Order Items")
+        logger.info("Running Query-2: Order Items")
         order_items = db_queries.fetch_order_items(business_date)
-        safe_log(logger, "INFO", f"Query-2 completed | rows={len(order_items)}")
+        logger.info( f"Query-2 completed | rows={len(order_items)}")
 
-        safe_log(logger, "INFO", "Running Query-3: ASN Process Numbers")
+        logger.info( "Running Query-3: ASN Process Numbers")
         asn_rows = db_queries.fetch_asn_process_numbers(business_date)
         process_numbers = [row["process_number"] for row in asn_rows]
-        safe_log(logger, "INFO", f"Query-3 completed | rows={len(process_numbers)}")
+        logger.info( f"Query-3 completed | rows={len(process_numbers)}")
 
         order_totals = []
         if process_numbers:
-            safe_log(logger, "INFO", "Running Query-4: Order Totals")
+            logger.info( "Running Query-4: Order Totals")
             order_totals = db_queries.fetch_order_totals(process_numbers)
-            safe_log(logger, "INFO", f"Query-4 completed | rows={len(order_totals)}")
+            logger.info( f"Query-4 completed | rows={len(order_totals)}")
         else:
-            safe_log(logger, "WARN", "Query-4 skipped (no ASN process numbers)")
+            logger.warning( "Query-4 skipped (no ASN process numbers)")
+
 
         return {
             "sales_orders": sales_orders,
@@ -52,22 +57,24 @@ class ReconciliationService:
 
     # ================= CSV PROCESSING =================
     @staticmethod
-    def process_converge_csvs(current_csv, settled_csv, logger):
+    def process_converge_files(current_csv, settled_csv, logger):
         csv_summary = {
             "current_batches": {
                 "total_rows": 0,
                 "valid_rows": 0,
-                "skipped_rows": 0
+                "skipped_rows": 0,
+                "rows":[]
             },
             "settled_batches": {
                 "total_rows": 0,
-                "transaction_type_breakdown": {}
+                "transaction_type_breakdown": {},
+                "rows":[]
             }
         }
 
         # ---------- CURRENTBATCHES ----------
         if current_csv:
-            safe_log(logger, "INFO", "Processing CURRENTBATCHES CSV")
+            logger.info( "Processing CURRENTBATCHES CSV")
 
             current_csv.file.seek(0)
             content = current_csv.file.read().decode("utf-8")
@@ -83,24 +90,22 @@ class ReconciliationService:
 
                 if not invoice or (txn_date and not (auth_msg or customer)):
                     csv_summary["current_batches"]["skipped_rows"] += 1
-                    safe_log(
-                        logger,
-                        "WARN",
-                        f"CURRENTBATCHES: Skipping row {row_num}"
-                    )
+                    logger.warn(f"CURRENTBATCHES: Skipping row {row_num}")
                     continue
 
                 csv_summary["current_batches"]["valid_rows"] += 1
+                csv_summary["current_batches"]["rows"].append({
+                    "invoice": invoice,
+                    "auth_message": auth_msg,
+                    "customer": customer,
+                    "transaction_date": txn_date
+                })
 
-            safe_log(
-                logger,
-                "INFO",
-                f"CURRENTBATCHES summary: {csv_summary['current_batches']}"
-            )
+            logger.info(f"CURRENTBATCHES summary: {csv_summary['current_batches']}")
 
         # ---------- SETTLEDBATCHES ----------
         if settled_csv:
-            safe_log(logger, "INFO", "Processing SETTLEDBATCHES CSV")
+            logger.info("Processing SETTLEDBATCHES CSV")
 
             txn_type_map = defaultdict(int)
             settled_csv.file.seek(0)
@@ -110,21 +115,28 @@ class ReconciliationService:
             for row_num, row in enumerate(reader, start=2):
                 csv_summary["settled_batches"]["total_rows"] += 1
 
+                amount = row.get("Original Amount", "").strip()
+                invoice = row.get("Invoice Number", "").strip()
+                status= row.get("Transaction Status").strip()
                 txn_type = row.get("Original Transaction Type", "").strip().upper()
                 if not txn_type:
                     txn_type = "UNKNOWN"
 
                 txn_type_map[txn_type] += 1
 
+                csv_summary["settled_batches"]["rows"].append({
+                    "invoice": invoice,
+                    "transaction_type": txn_type,
+                    "amount": amount,
+                    "status":status
+                })
             csv_summary["settled_batches"]["transaction_type_breakdown"] = dict(txn_type_map)
 
-            safe_log(
-                logger,
-                "INFO",
-                f"SETTLEDBATCHES summary: {csv_summary['settled_batches']}"
-            )
+            logger.info(f"SETTLEDBATCHES summary: {csv_summary['settled_batches']}");
+
 
         return csv_summary
+
 
     # ================= RECONCILIATION LOGIC =================
     @staticmethod
@@ -161,3 +173,34 @@ class ReconciliationService:
                 f"{diff} extra settlements found"
             )
         }
+
+    @staticmethod
+    def generate_reconciliation_workbook(
+            business_date: str,
+            reconciliation_data: dict,
+            csv_summary: dict
+    ):
+        writer = ReconciliationWorkbookWriter(business_date)
+
+        # Sheet 1: CXP
+        writer.create_cxp_sheet(
+            sales_orders=reconciliation_data["sales_orders"],
+            order_items=reconciliation_data["order_items"]
+        )
+
+        # Sheet 2: Converge
+        writer.create_converge_sheet(
+            converge_rows=csv_summary["current_batches"]["rows"]
+        )
+
+        # Sheet 3: Converge Settled
+        writer.create_converge_settled_sheet(
+            settled_rows=csv_summary["settled_batches"]["rows"]
+        )
+
+        # Sheet 4: Orders Shipped
+        writer.create_orders_shipped_sheet(
+            shipped_numbers=reconciliation_data["asn_process_numbers"]
+        )
+
+        return writer.to_bytes()
