@@ -71,7 +71,7 @@ class ReconciliationWorkbookWriter:
         sheet.append(headers)
 
         for row in settled_rows:
-            sheet.append([row.get("invoice"), row.get("amount"), row.get("txn_type")])
+            sheet.append([row.get("invoice"), row.get("amount"),row.get("status"), row.get("transaction_type")])
 
     # ================= SHEET 4: ORDERS SHIPPED =================
     def create_orders_shipped_sheet(self, shipped_numbers: list):

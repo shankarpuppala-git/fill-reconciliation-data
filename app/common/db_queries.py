@@ -1,7 +1,14 @@
-from app.db.db_client import get_connection
+from app.db.db_client import get_db_connection
 
 
-# ---------------- QUERY 1 ----------------
+def fetch_all_dicts(sql: str, params: tuple | None = None) -> list[dict]:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(sql, params or ())
+            columns = [col[0] for col in cursor.description]
+            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+
 def fetch_sales_orders(business_date):
     sql = """
         SELECT
@@ -16,17 +23,9 @@ def fetch_sales_orders(business_date):
           AND process_number ILIKE 'CXCL%%'
         ORDER BY order_date DESC
     """
-
-    conn = get_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(sql, (business_date,))
-            return cursor.fetchall()
-    finally:
-        conn.close()
+    return fetch_all_dicts(sql, (business_date,))
 
 
-# ---------------- QUERY 2 ----------------
 def fetch_order_items(business_date):
     sql = """
         SELECT
@@ -40,17 +39,9 @@ def fetch_order_items(business_date):
               AND process_number ILIKE 'CXCL%%'
         )
     """
-
-    conn = get_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(sql, (business_date,))
-            return cursor.fetchall()
-    finally:
-        conn.close()
+    return fetch_all_dicts(sql, (business_date,))
 
 
-# ---------------- QUERY 3 ----------------
 def fetch_asn_process_numbers(business_date):
     sql = """
         SELECT DISTINCT
@@ -58,23 +49,14 @@ def fetch_asn_process_numbers(business_date):
         FROM pzv_aftermarket.asn_request_log arl
         WHERE arl.created_on > DATE %s
     """
-
-    conn = get_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(sql, (business_date,))
-            return cursor.fetchall()
-    finally:
-        conn.close()
+    return fetch_all_dicts(sql, (business_date,))
 
 
-# ---------------- QUERY 4 ----------------
 def fetch_order_totals(process_numbers):
     if not process_numbers:
         return []
 
     placeholders = ",".join(["%s"] * len(process_numbers))
-
     sql = f"""
         SELECT
             process_number,
@@ -82,11 +64,4 @@ def fetch_order_totals(process_numbers):
         FROM pzv_aftermarket.pzv_sales_order pso
         WHERE process_number IN ({placeholders})
     """
-
-    conn = get_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(sql, tuple(process_numbers))
-            return cursor.fetchall()
-    finally:
-        conn.close()
+    return fetch_all_dicts(sql, tuple(process_numbers))
