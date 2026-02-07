@@ -1,12 +1,9 @@
-from cmath import exp
-from unittest import expectedFailure
 
-from exceptiongroup import catch
 from fastapi import APIRouter, Form, UploadFile, File
 
 from app.service.reconciliation_service import ReconciliationService
-from fastapi.responses import StreamingResponse
-from datetime import datetime
+from fastapi.responses import Response
+from urllib.parse import quote
 import logging
 
 router = APIRouter()
@@ -21,6 +18,8 @@ async def run_reconciliation(
 ):
 
     logger.info("Reconciliation started | business_date=%s", business_date)
+    reconciliation_data = None
+    csv_summary = None
 
     try:
         reconciliation_data = ReconciliationService.run_db_queries(business_date=business_date,logger=logger)
@@ -33,7 +32,7 @@ async def run_reconciliation(
         )
     except Exception as e:
         logger.exception("Reconciliation failed | business_date=%s", business_date)
-        logger.exception(e)
+        raise
 
     try:
         csv_summary = ReconciliationService.process_converge_files(current_csv=current_batch_csv,settled_csv=settled_batch_csv,logger=logger)
@@ -57,20 +56,30 @@ async def run_reconciliation(
         raise
 
     # Excel generation
-    excel_bytes = ReconciliationService.generate_reconciliation_workbook(
+    excel_io = ReconciliationService.generate_reconciliation_workbook(
         business_date=business_date,
         reconciliation_data=reconciliation_data,
         csv_summary=csv_summary
     )
     filename = f"Reconciliation_{business_date}.xlsx"
+    encoded_filename = quote(filename)
+    if not filename.endswith('.xlsx'):
+        filename += '.xlsx'
+    excel_bytes = excel_io.getvalue()
 
     logger.info("Reconciliation completed  Successfully | business_date=%s", business_date)
 
-    return StreamingResponse(
-        excel_bytes,
+    logger.info("Filename: %s", filename)
+    logger.info("Encoded filename: %s", encoded_filename)
+    logger.info("Headers: %s", {
+        "Content-Disposition": f'attachment; filename="{filename}"'
+    })
+    return Response(
+        content=excel_bytes,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"'
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(excel_bytes))
         }
     )
 

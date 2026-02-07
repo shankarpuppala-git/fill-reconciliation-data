@@ -5,7 +5,9 @@ from io import TextIOWrapper
 from collections import defaultdict
 
 from app.common import db_queries
+from app.db.db_client import get_db_connection
 from app.sheets.workbook_writer import ReconciliationWorkbookWriter
+
 
 
 
@@ -44,6 +46,7 @@ class ReconciliationService:
             logger.info( f"Query-4 completed | rows={len(order_totals)}")
         else:
             logger.warning( "Query-4 skipped (no ASN process numbers)")
+
 
         return {
             "sales_orders": sales_orders,
@@ -112,10 +115,9 @@ class ReconciliationService:
             for row_num, row in enumerate(reader, start=2):
                 csv_summary["settled_batches"]["total_rows"] += 1
 
-                txn_type = row.get("Original Transaction Type", "").strip().upper()
                 amount = row.get("Original Amount", "").strip()
                 invoice = row.get("Invoice Number", "").strip()
-
+                status= row.get("Transaction Status").strip()
                 txn_type = row.get("Original Transaction Type", "").strip().upper()
                 if not txn_type:
                     txn_type = "UNKNOWN"
@@ -125,7 +127,8 @@ class ReconciliationService:
                 csv_summary["settled_batches"]["rows"].append({
                     "invoice": invoice,
                     "transaction_type": txn_type,
-                    "amount": amount
+                    "amount": amount,
+                    "status":status
                 })
             csv_summary["settled_batches"]["transaction_type_breakdown"] = dict(txn_type_map)
 
@@ -199,7 +202,5 @@ class ReconciliationService:
         writer.create_orders_shipped_sheet(
             shipped_numbers=reconciliation_data["asn_process_numbers"]
         )
-
-
 
         return writer.to_bytes()
