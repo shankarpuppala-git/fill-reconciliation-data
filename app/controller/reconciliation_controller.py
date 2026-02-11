@@ -1,86 +1,154 @@
-
+import logging
 from fastapi import APIRouter, Form, UploadFile, File
-
-from app.service.reconciliation_service import ReconciliationService
 from fastapi.responses import Response
 from urllib.parse import quote
-import logging
+
+from app.common import db_queries
+from app.service.reconciliation_service import ReconciliationService
+from app.sheets.workbook_writer import ReconciliationWorkbookWriter
 
 router = APIRouter()
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("controller.reconciliation")
 
 
 @router.post("/reconciliation/run")
 async def run_reconciliation(
-    business_date: str = Form(...),
-    current_batch_csv: UploadFile = File(None),
-    settled_batch_csv: UploadFile = File(None)
+        business_date: str = Form(...),
+        current_batch_csv: UploadFile = File(None),
+        settled_batch_csv: UploadFile = File(None)
 ):
+    logger.info("Reconciliation request received | business_date=%s", business_date)
 
-    logger.info("Reconciliation started | business_date=%s", business_date)
-    reconciliation_data = None
-    csv_summary = None
+    # =====================================================
+    # STEP 1: DB QUERIES (SOURCE OF TRUTH)
+    # =====================================================
+    logger.info("Running DB queries")
 
-    try:
-        reconciliation_data = ReconciliationService.run_db_queries(business_date=business_date,logger=logger)
+    sales_orders = db_queries.fetch_sales_orders(business_date)
+    logger.info("Sales orders fetched | count=%s", len(sales_orders))
 
-        shipped_count = len(reconciliation_data.get("asn_process_numbers", []))
-        logger.info(
-            "DB reconciliation completed | business_date=%s | shipped_orders=%s",
-            business_date,
-            shipped_count
-        )
-    except Exception as e:
-        logger.exception("Reconciliation failed | business_date=%s", business_date)
-        raise
+    order_items = db_queries.fetch_order_items(business_date)
+    logger.info("Order items fetched | count=%s", len(order_items))
 
-    try:
-        csv_summary = ReconciliationService.process_converge_files(current_csv=current_batch_csv,settled_csv=settled_batch_csv,logger=logger)
-        logger.info(
-            "CSV processed | business_date=%s | settled_batches=%s",
-            business_date,
-            csv_summary.get("settled_batches", {}).get("total_rows", 0)
-        )
-    except Exception as e:
-        logger.exception("CSV file  failed | business_date=%s", business_date)
-        logger.exception(e)
-        raise
+    asn_rows = db_queries.fetch_asn_process_numbers(business_date)
+    asn_process_numbers = [r["process_number"] for r in asn_rows]
+    logger.info("ASN process numbers fetched | count=%s", len(asn_process_numbers))
 
-    try:
-        logger.info("Reconciliation shipped vs settled | business_date=%s", business_date)
-        reconciliation_result = ReconciliationService.reconcile_shipped_vs_settled(reconciliation_data["asn_process_numbers"],csv_summary["settled_batches"]["transaction_type_breakdown"])
-        logger.info("result of the shipped and settled orders %s",reconciliation_result)
+    order_totals = db_queries.fetch_order_totals(asn_process_numbers)
+    logger.info("Order totals fetched | count=%s", len(order_totals))
 
-    except Exception as e:
-        logger.exception("Reocniliation logic failed | business_date=%s", business_date)
-        raise
+    # =====================================================
+    # MERGE: Add fulfillment_status to sales_orders
+    # =====================================================
+    order_status_lookup = {}
+    for item in order_items:
+        order_id = item["order_process_number"]
+        if order_id not in order_status_lookup:
+            order_status_lookup[order_id] = item["order_status"]
 
-    # Excel generation
-    excel_io = ReconciliationService.generate_reconciliation_workbook(
-        business_date=business_date,
-        reconciliation_data=reconciliation_data,
-        csv_summary=csv_summary
+    for order in sales_orders:
+        order_id = order["process_number"]
+        order["fulfillment_status"] = order_status_lookup.get(order_id, None)
+
+    logger.info("Merged order items into sales orders | orders_with_items=%s",
+                sum(1 for o in sales_orders if o.get("fulfillment_status")))
+
+    # =====================================================
+    # STEP 2: READ CSV FILES (RAW ROWS)
+    # =====================================================
+    def read_csv(upload: UploadFile):
+        if not upload:
+            return []
+
+        upload.file.seek(0)
+        content = upload.file.read().decode("utf-8").splitlines()
+        import csv
+        return list(csv.DictReader(content))
+
+    converge_current_rows = read_csv(current_batch_csv)
+    converge_settled_rows = read_csv(settled_batch_csv)
+
+    logger.info(
+        "CSV files read | current_rows=%s | settled_rows=%s",
+        len(converge_current_rows),
+        len(converge_settled_rows)
     )
+
+    # =====================================================
+    # STEP 3: CALL SERVICE LAYER (PURE LOGIC)
+    # =====================================================
+    reconciliation_result = ReconciliationService.run_reconciliation(
+        cxp_orders=sales_orders,
+        converge_current_rows=converge_current_rows,
+        converge_settled_rows=converge_settled_rows
+    )
+
+    classification = reconciliation_result["classification"]
+    converge_current_result = reconciliation_result.get("converge_current_result")
+    converge_settled_result = reconciliation_result["converge_settled_result"]
+
+    logger.info(
+        "Classification summary | success=%s | failed=%s | risky=%s | retry_success=%s",
+        len(classification["successful_orders"]),
+        len(classification["failed_orders"]),
+        len(classification["risky_orders"]),
+        len(classification["retry_success_orders"])
+    )
+
+    # =====================================================
+    # STEP 4: EXCEL GENERATION (PRESENTATION)
+    # =====================================================
+    writer = ReconciliationWorkbookWriter(business_date)
+
+    # Sheet 1: CXP with highlighting
+    writer.create_cxp_sheet(
+        sales_orders=sales_orders,
+        order_items=order_items,
+        classification=classification,
+        converge_current=converge_current_result,
+        converge_settled=converge_settled_result,
+        asn_process_numbers=asn_process_numbers
+    )
+
+    # Sheet 2: Converge with highlighting
+    writer.create_converge_sheet(
+        converge_rows=converge_current_rows,
+        converge_current=converge_current_result,
+        sales_orders=sales_orders  # ADD THIS LINE
+    )
+
+    # Sheet 3: Converge Settled with highlighting
+    writer.create_converge_settled_sheet(converge_settled_rows)
+
+    # Sheet 4: Orders Shipped with ASN vs Settled comparison
+    writer.create_orders_shipped_sheet(
+        asn_process_numbers=asn_process_numbers,
+        order_totals=order_totals,
+        converge_settled=converge_settled_result
+    )
+
+    # Sheet 5: RECONCILIATION REPORT (The main one!)
+    writer.create_reconciliation_sheet(
+        cxp_orders=sales_orders,
+        classification=classification,
+        converge_current=converge_current_result,
+        converge_settled=converge_settled_result,
+        asn_process_numbers=asn_process_numbers,
+        order_totals=order_totals
+    )
+
+    excel_io = writer.to_bytes()
+
     filename = f"Reconciliation_{business_date}.xlsx"
     encoded_filename = quote(filename)
-    if not filename.endswith('.xlsx'):
-        filename += '.xlsx'
-    excel_bytes = excel_io.getvalue()
 
-    logger.info("Reconciliation completed  Successfully | business_date=%s", business_date)
+    logger.info("Reconciliation completed successfully | business_date=%s", business_date)
 
-    logger.info("Filename: %s", filename)
-    logger.info("Encoded filename: %s", encoded_filename)
-    logger.info("Headers: %s", {
-        "Content-Disposition": f'attachment; filename="{filename}"'
-    })
     return Response(
-        content=excel_bytes,
+        content=excel_io.getvalue(),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "Content-Length": str(len(excel_bytes))
+            "Content-Disposition": f'attachment; filename="{encoded_filename}"',
+            "Content-Length": str(len(excel_io.getvalue()))
         }
     )
-
-
