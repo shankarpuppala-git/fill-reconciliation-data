@@ -20,7 +20,8 @@ class ReconciliationService:
     def run_reconciliation(
             cxp_orders: list,
             converge_current_rows: list,
-            converge_settled_rows: list
+            converge_settled_rows: list,
+            order_totals: dict = None  #
     ) -> dict:
         """
         Main entry point for reconciliation.
@@ -92,7 +93,8 @@ class ReconciliationService:
         classification_result = classify_orders(
             cxp_orders=cxp_orders,
             converge_current={"invoices": converge_current},
-            converge_settled=converge_settled_result
+            converge_settled=converge_settled_result,
+            order_totals=order_totals
         )
 
         logger.info(
