@@ -1,36 +1,136 @@
 import logging
-from fastapi import APIRouter, Form, UploadFile, File
+from datetime import date, datetime, timedelta
+
+from fastapi import APIRouter, Form, UploadFile, File, HTTPException
 from fastapi.responses import Response
 from urllib.parse import quote
 
 from app.common import db_queries
 from app.service.reconciliation_service import ReconciliationService
+
 from app.sheets.workbook_writer import ReconciliationWorkbookWriter
 
 router = APIRouter()
 logger = logging.getLogger("controller.reconciliation")
 
+# =====================================================
+# CONFIGURATION: Max date range allowed (in days)
+# =====================================================
+MAX_DATE_RANGE_DAYS = 31  # Change this value to increase/decrease allowed range
 
-@router.post("/reconciliation/run")
+
+@router.post("/run")
 async def run_reconciliation(
-        business_date: str = Form(...),
+        start_date: str = Form(...),
+        end_date: str = Form(...),
         current_batch_csv: UploadFile = File(None),
-        settled_batch_csv: UploadFile = File(None)
+        settled_batch_csv: UploadFile = File(None),
+        notification_emails: str = Form(None)  # Optional: comma-separated emails
 ):
-    logger.info("Reconciliation request received | business_date=%s", business_date)
+    logger.info("Reconciliation request received | start_date=%s | end_date=%s", start_date, end_date)
+
+    # =====================================================
+    # STEP 0: VALIDATIONS
+    # =====================================================
+
+    # ---------- Date Format Validation ----------
+    try:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid start_date format. Expected YYYY-MM-DD"
+        )
+
+    try:
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid end_date format. Expected YYYY-MM-DD"
+        )
+
+    # ---------- Date Range Validation ----------
+    if start_dt > date.today():
+        raise HTTPException(
+            status_code=400,
+            detail="start_date cannot be a future date"
+        )
+
+    if end_dt > date.today() + timedelta(days=1):
+        raise HTTPException(
+            status_code=400,
+            detail="end_date cannot be a future date (can be tomorrow at most)"
+        )
+
+    if end_dt < start_dt:
+        raise HTTPException(
+            status_code=400,
+            detail="end_date cannot be earlier than start_date"
+        )
+
+    if end_dt == start_dt:
+        raise HTTPException(
+            status_code=400,
+            detail="end_date must be at least 1 day after start_date (for single day report, use start_date='2026-02-11' and end_date='2026-02-12')"
+        )
+
+    # Calculate date range in days
+    date_range_days = (end_dt - start_dt).days
+
+    if date_range_days > MAX_DATE_RANGE_DAYS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Date range cannot exceed {MAX_DATE_RANGE_DAYS} days. Requested range: {date_range_days} days. "
+                   f"Please reduce the date range or contact administrator to increase the limit."
+        )
+
+    logger.info("Date range validation passed | days=%s | max_allowed=%s", date_range_days, MAX_DATE_RANGE_DAYS)
+
+    # ---------- File Presence Validation ----------
+    if not current_batch_csv and not settled_batch_csv:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one CSV file must be provided"
+        )
+
+    # ---------- File Validation Helper ----------
+    async def validate_csv_file(file: UploadFile, file_name: str):
+        if not file:
+            return
+
+        if not file.filename.lower().endswith(".csv"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{file_name} must be a CSV file"
+            )
+
+        contents = await file.read()
+        if not contents:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{file_name} is empty"
+            )
+
+        # Reset file pointer for later reading
+        file.file.seek(0)
+
+    # ---------- Validate Files ----------
+    await validate_csv_file(current_batch_csv, "current_batch_csv")
+    await validate_csv_file(settled_batch_csv, "settled_batch_csv")
 
     # =====================================================
     # STEP 1: DB QUERIES (SOURCE OF TRUTH)
     # =====================================================
-    logger.info("Running DB queries")
+    logger.info("Running DB queries for date range")
 
-    sales_orders = db_queries.fetch_sales_orders(business_date)
+    sales_orders = db_queries.fetch_sales_orders(start_date, end_date)
     logger.info("Sales orders fetched | count=%s", len(sales_orders))
 
-    order_items = db_queries.fetch_order_items(business_date)
+    order_items = db_queries.fetch_order_items(start_date, end_date)
     logger.info("Order items fetched | count=%s", len(order_items))
 
-    asn_rows = db_queries.fetch_asn_process_numbers(business_date)
+    asn_rows = db_queries.fetch_asn_process_numbers(start_date, end_date)
     asn_process_numbers = [r["process_number"] for r in asn_rows]
     logger.info("ASN process numbers fetched | count=%s", len(asn_process_numbers))
 
@@ -87,18 +187,12 @@ async def run_reconciliation(
     converge_current_result = reconciliation_result.get("converge_current_result")
     converge_settled_result = reconciliation_result["converge_settled_result"]
 
-    logger.info(
-        "Classification summary | success=%s | failed=%s | risky=%s | retry_success=%s",
-        len(classification["successful_orders"]),
-        len(classification["failed_orders"]),
-        len(classification["risky_orders"]),
-        len(classification["retry_success_orders"])
-    )
 
     # =====================================================
     # STEP 4: EXCEL GENERATION (PRESENTATION)
     # =====================================================
-    writer = ReconciliationWorkbookWriter(business_date)
+    # Use start_date for filename
+    writer = ReconciliationWorkbookWriter(start_date)
 
     # Sheet 1: CXP with highlighting
     writer.create_cxp_sheet(
@@ -114,7 +208,7 @@ async def run_reconciliation(
     writer.create_converge_sheet(
         converge_rows=converge_current_rows,
         converge_current=converge_current_result,
-        sales_orders=sales_orders  # ADD THIS LINE
+        sales_orders=sales_orders
     )
 
     # Sheet 3: Converge Settled with highlighting
@@ -127,7 +221,7 @@ async def run_reconciliation(
         converge_settled=converge_settled_result
     )
 
-    # Sheet 5: RECONCILIATION REPORT (The main one!)
+    # Sheet 5: RECONCILIATION REPORT
     writer.create_reconciliation_sheet(
         cxp_orders=sales_orders,
         classification=classification,
@@ -139,10 +233,17 @@ async def run_reconciliation(
 
     excel_io = writer.to_bytes()
 
-    filename = f"Reconciliation_{business_date}.xlsx"
+    if start_date == end_date:
+        filename = f"Reconciliation_{start_date}.xlsx"
+    else:
+        filename = f"Reconciliation_{start_date}_to_{end_date}.xlsx"
+
     encoded_filename = quote(filename)
 
-    logger.info("Reconciliation completed successfully | business_date=%s", business_date)
+
+
+
+    logger.info("Reconciliation completed successfully | start_date=%s | end_date=%s", start_date, end_date)
 
     return Response(
         content=excel_io.getvalue(),

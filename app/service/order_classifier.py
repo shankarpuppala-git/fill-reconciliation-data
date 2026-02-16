@@ -34,8 +34,9 @@ def classify_orders(
     orders_result = {}
     successful_orders = []
     failed_orders = set()
-    risky_orders = []
+    action_required_orders = []
     retry_success_orders = []
+    converge_data_inconsistencies = []
 
     customer_history = defaultdict(list)
 
@@ -70,16 +71,13 @@ def classify_orders(
         if cxp_db_status == "ERROR":
             state = "RISKY"
             risk_reason = "CXP_ERROR_STATE"
-        elif cxp_db_status == "SUCCESS" and converge_status == "NA" and not is_settled:
+
+        elif cxp_db_status == "SUCCESS" and converge_status == "NA" and not is_settled and cxp_status in  ("ORDERED","CLAIMED"):
             state = "RISKY"
-            risk_reason="Order Placed but no Payment data available"
+            risk_reason="Order Placed into CXP but no Payment data available from converge"
 
         # ===== PAYMENT CANCELLED =====
         elif cxp_db_status == "PAYMENT_CANCELLED":
-            state = "FAILED"
-
-        # ===== FAILED – bank / fraud =====
-        elif converge_status in ("DECLINED", "SUSPECTED FRAUD") or "DECLINED" in converge_status:
             state = "FAILED"
 
         # ===== RISKY – shipped but not settled =====
@@ -87,15 +85,20 @@ def classify_orders(
             state = "RISKY"
             risk_reason = "SHIPPED_NOT_SETTLED"
 
+        # ===== FAILED – bank / fraud =====
+        elif converge_status in ("DECLINED", "SUSPECTED FRAUD") or "DECLINED" in converge_status:
+            state = "FAILED"
+
         # ===== RISKY – payment success but order missing =====
         elif not cxp_status and converge_status == "APPROVAL":
             state = "RISKY"
-            risk_reason = "PAYMENT_WITHOUT_ORDER"
+            risk_reason = "PAYMENT_SUCCESS_PLACE_ORDER_FAILED"
 
         # ===== RISKY – converge inconsistency =====
         elif is_data_issue:
-            state = "RISKY"
+            state = "VERIFICATION_NEEDED"
             risk_reason = "CONVERGE_DATA_INCONSISTENCY"
+            successful_orders.append(order_id)
 
         # ===== SUCCESS – shipped + settled =====
         elif cxp_status == "SHIPPED" and is_settled:
@@ -125,14 +128,16 @@ def classify_orders(
         elif state == "FAILED":
             failed_orders.add(order_id)
         elif state == "RISKY":
-            risky_orders.append(order_id)
+            action_required_orders.append(order_id)
+        elif state == "VERIFICATION_NEEDED":
+            converge_data_inconsistencies.append(order_id)
 
         customer_key = email or phone
         if customer_key:
             customer_history[customer_key].append((order_id, state))
 
         logger.info(
-            "Order classified | order=%s | state=%s | risk_reason=%s | cxp=%s | cxp_db=%s | converge=%s | settled=%s",
+            "Order classified | order=%s | state=%s | classification_reason=%s | cxp_status=%s | cxp_db_status=%s | converge=%s | settled=%s",
             order_id,
             state,
             risk_reason,
@@ -152,18 +157,35 @@ def classify_orders(
                 orders_result[order_id]["is_retry_success"] = True
                 retry_success_orders.append(order_id)
 
-                logger.warning(
+                logger.info(
                     "Retry success detected | customer=%s | order=%s",
                     customer,
                     order_id
                 )
+    if len(action_required_orders) > 0:
+        for order_id in action_required_orders:
+            order_info = orders_result.get(order_id)
+
+            if not order_info:
+                logger.warning(f"order {order_id} not found in orders_result")
+                continue
+
+            risk_reason = order_info.get("risk_reason", "Unknown reason")
+
+            logger.warning(
+                f"ATTENTION REQUIRED | order_id={order_id} | reason={risk_reason}"
+            )
+    else:
+        logger.info("No  orders require your attention")
 
     logger.info("Order classification completed")
+
 
     return {
         "orders": orders_result,
         "successful_orders": successful_orders,
         "failed_orders": list(failed_orders),
-        "risky_orders": risky_orders,
-        "retry_success_orders": retry_success_orders
+        "action_required_orders": action_required_orders,
+        "retry_success_orders": retry_success_orders,
+        "converge_data_inconsistencies": converge_data_inconsistencies
     }

@@ -96,13 +96,15 @@ class ReconciliationService:
         )
 
         logger.info(
-            "Classification completed | success=%s | failed=%s | risky=%s | retry_success=%s",
+            "Classification completed |Total orders = %s |success=%s | failed=%s | action_required=%s | retry_success=%s",
+            len(cxp_orders),
             len(classification_result["successful_orders"]),
             len(classification_result["failed_orders"]),
-            len(classification_result["risky_orders"]),
+            len(classification_result["action_required_orders"]),
             len(classification_result["retry_success_orders"])
         )
-
+        if len(classification_result["converge_data_inconsistencies"])>0:
+            logger.info("converge data inconsistencies %s",len(classification_result["converge_data_inconsistencies"]))
         logger.info("===== Reconciliation process completed =====")
 
         # Return complete results for Excel generation

@@ -1,14 +1,14 @@
 from contextlib import asynccontextmanager
-
 import uvicorn
 from fastapi import FastAPI
 from dotenv import load_dotenv
 
 from app.common.logger import setup_logging
 from app.db.db_client import init_pool, close_pool
-from app.controller.reconciliation_controller import router
+from app.controller import reconciliation_controller
 
-# Load env + logging
+
+# Load env + logging FIRST
 load_dotenv()
 setup_logging()
 
@@ -22,6 +22,7 @@ async def lifespan(app: FastAPI):
     close_pool()
 
 
+# CREATE APP ONCE
 app = FastAPI(
     title="Reconciliation Service",
     version="1.0.0",
@@ -29,8 +30,13 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Register routes
-app.include_router(router)
+# REGISTER ROUTERS AFTER APP CREATION
+app.include_router(
+    reconciliation_controller.router,
+    prefix="/reconciliation",
+    tags=["reconciliation"]
+)
+
 
 
 @app.get("/health")

@@ -1,11 +1,13 @@
 from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.cell.cell import MergedCell
 from io import BytesIO
 from collections import defaultdict
-from openpyxl.cell.cell import MergedCell
+from openpyxl.comments import Comment
 import logging
 logger = logging.getLogger("workbook_writer")
+
 
 class ReconciliationWorkbookWriter:
 
@@ -111,12 +113,14 @@ class ReconciliationWorkbookWriter:
             row_num += 1
 
         self._auto_fit_columns(sheet)
+        self._apply_borders(sheet)
 
     # ================= SHEET 2: CONVERGE WITH HIGHLIGHTING =================
     def create_converge_sheet(self, converge_rows: list, converge_current: dict, sales_orders: list):
         """
         Creates Converge sheet with card issue highlighting
         Includes CXP DB Status and Email from sales_orders lookup
+        NO "Yes" text in Card Related Issues column - just highlighting
         """
         sheet = self.workbook.create_sheet("Converge")
 
@@ -179,6 +183,8 @@ class ReconciliationWorkbookWriter:
             row_num += 1
 
         self._auto_fit_columns(sheet)
+        self._apply_borders(sheet)
+
     # ================= SHEET 3: CONVERGE SETTLED WITH HIGHLIGHTING =================
     def create_converge_settled_sheet(self, settled_rows: list):
         """
@@ -222,6 +228,8 @@ class ReconciliationWorkbookWriter:
             row_num += 1
 
         self._auto_fit_columns(sheet)
+        self._apply_borders(sheet)
+
 
     # ================= SHEET 4: ORDERS SHIPPED WITH COMPARISON =================
     def create_orders_shipped_sheet(
@@ -237,7 +245,7 @@ class ReconciliationWorkbookWriter:
 
         headers = [
             "Order no.", "Sum of Total CXP", "MATCHING WITH CONVERGE",
-            "Differences", "Order no", "Amount"
+            "Differences"
         ]
 
         sheet.append(headers)
@@ -276,9 +284,7 @@ class ReconciliationWorkbookWriter:
                 order_id,
                 cxp_amount,
                 matching_status,
-                difference,
-                order_id,  # Repeated for second section
-                converge_amount if converge_amount else "NA"
+                difference
             ]
 
             sheet.append(row_data)
@@ -288,11 +294,12 @@ class ReconciliationWorkbookWriter:
                 self._apply_row_fill(sheet, row_num, len(headers), "FFC7CE")  # Light red
                 # Add comment for missing orders
                 if not is_in_converge:
-                    sheet.cell(row=row_num, column=3).comment = "Order in ASN but not in Settled batch"
+                    sheet.cell(row=row_num, column=1).comment = Comment("Order received ASN but not  Settled","Reconciliation")
 
             row_num += 1
 
         self._auto_fit_columns(sheet)
+        self._apply_borders(sheet)
 
     # ================= SHEET 5: RECONCILIATION (THE BIG ONE) =================
     def create_reconciliation_sheet(
@@ -331,7 +338,6 @@ class ReconciliationWorkbookWriter:
         self._apply_sub_header_style(sheet, current_row, len(headers_1))
         current_row += 1
         # NO DATA ROWS - just headers
-
         current_row += 2  # Blank rows
 
         # ===== SECTION 2: Headers only =====
@@ -426,7 +432,8 @@ class ReconciliationWorkbookWriter:
 
         # Get all FAILED order IDs
         failed_order_ids = set(classification["failed_orders"])
-        internal_users={"amit.kumar@phasezeroventures.com"}
+
+        internal_users = {"amit.kumar@phasezeroventures.com"}
 
         # Add ONLY failed orders
         for order in cxp_orders:
@@ -435,12 +442,13 @@ class ReconciliationWorkbookWriter:
             email = order.get("notif_email", "").strip().lower()
 
             if email in internal_users:
-                logger.info("Internal user email %s",email)
+                logger.info("Internal user email %s", email)
                 continue
 
             # Only add if this order is in failed list
             if order_id in failed_order_ids:
                 order_class = orders_dict.get(order_id, {})
+
                 sheet.append([
                     order_id,
                     order.get("notif_email"),
@@ -452,7 +460,18 @@ class ReconciliationWorkbookWriter:
                 current_row += 1
 
         self._auto_fit_columns(sheet)
+        self._apply_borders(sheet)
+
     # ================= HELPER METHODS FOR STYLING =================
+    def _apply_borders(self, sheet):
+        thin = Side(style="thin")
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+        for row in sheet.iter_rows():
+            for cell in row:
+                if isinstance(cell, MergedCell):
+                    continue
+                cell.border = border
     def _apply_header_style(self, sheet, row, col_count):
         """Apply dark blue header style"""
         dark_blue_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
@@ -493,8 +512,7 @@ class ReconciliationWorkbookWriter:
         return row + 1
 
     def _auto_fit_columns(self, sheet):
-        """Auto-fit column widths based on content"""
-
+        """Auto-fit column widths based on content - FIXED for merged cells"""
         for column in sheet.columns:
             max_length = 0
             column_letter = None
@@ -518,6 +536,7 @@ class ReconciliationWorkbookWriter:
             if column_letter:
                 adjusted_width = min(max_length + 2, 50)
                 sheet.column_dimensions[column_letter].width = adjusted_width
+
     # ================= SAVE =================
     def save(self, directory: str = "."):
         path = f"{directory}/{self.get_filename()}"
@@ -525,9 +544,6 @@ class ReconciliationWorkbookWriter:
         return path
 
     def to_bytes(self) -> BytesIO:
-        """
-        Returns Excel workbook as in-memory bytes
-        """
         output = BytesIO()
         self.workbook.save(output)
         output.seek(0)
