@@ -1,7 +1,7 @@
 import logging
 from collections import defaultdict
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, date
+from typing import Optional, List
 
 logger = logging.getLogger("classifier.orders")
 
@@ -10,32 +10,42 @@ def classify_orders(
         cxp_orders: list,
         converge_current: dict,
         converge_settled: dict,
-        order_totals: Optional[dict] = None  # ✅ NEW: For settlement amount validation
+        order_totals: Optional[dict] = None,
+        asn_process_numbers: Optional[List[str]] = None
 ) -> dict:
     """
     Classifies orders into:
-    - SUCCESS
-    - FAILED
-    - RISKY
-    - VERIFICATION_NEEDED
-
-    Adds risk_reason for RISKY orders.
-    Detects retry success cases.
+    - SUCCESS         : order completed correctly (includes VERIFICATION_NEEDED / data inconsistency)
+    - FAILED          : order definitively failed (cancelled, declined, fraud)
+    - ACTION_REQUIRED : requires manual intervention
+        Reasons:
+          CXP_ERROR_STATE            – order_state = ERROR in CXP
+          NO_PAYMENT_DATA            – CXP success but no converge record at all
+          ASN_NOT_SETTLED            – ASN received (physically shipped) but payment not settled
+          SHIPPED_NOT_SETTLED        – CXP status SHIPPED but not settled (no ASN)
+          SHIPPED_NOT_SETTLED        – CXP status SHIPPED but payment not yet settled
+          PAYMENT_SUCCESS_ORDER_FAILED – converge approved but no CXP fulfillment
+          SETTLEMENT_ANOMALY         – duplicate SALE rows or RETURN without SALE in settled batch
+          SETTLEMENT_AMOUNT_MISMATCH – settled amount differs from CXP order total by > $0.01
 
     PRIORITY ORDER:
-    1. ERROR state (TOP PRIORITY)
-    2. No payment data available
-    3. PAYMENT_CANCELLED
-    4. Shipped but not settled
-    5. Bank/fraud issues
-    6. Payment success but order failed
-    7. Data inconsistencies
-    8. Settlement amount mismatch (NEW)
-    9. Success cases
-    10. Everything else = FAILED
+      1. CXP ERROR state
+      2. No payment data
+      3. Payment cancelled  → FAILED
+      4. ASN received but not settled
+      5. Shipped in CXP but Converge DECLINED/FRAUD
+      6. Shipped in CXP but not settled (no ASN)
+      7. Payment approved but order has no fulfillment status
+      8. Settlement anomaly (duplicate SALE rows etc.)
+      9. SUCCESS – Shipped + Settled  (with amount validation)
+      10. SUCCESS – Ordered/Claimed + Approved (with amount validation)
+      11. DECLINED / FRAUD  → FAILED
+      12. Default → FAILED
     """
 
     logger.info("Starting order classification for %s orders", len(cxp_orders))
+
+    asn_set = set(asn_process_numbers) if asn_process_numbers else set()
 
     orders_result = {}
     successful_orders = []
@@ -43,7 +53,7 @@ def classify_orders(
     action_required_orders = []
     retry_success_orders = []
     converge_data_inconsistencies = []
-    settlement_amount_mismatches = []  # ✅ NEW
+    settlement_amount_mismatches = []
 
     customer_history = defaultdict(list)
 
@@ -51,14 +61,14 @@ def classify_orders(
     converge_invoices = converge_current.get("invoices", {})
     settled_invoices = converge_settled.get("invoice_level", {})
 
-    # Build order totals map
+    # Normalise order_totals to dict {process_number: order_total}
     order_totals_map = {}
     if order_totals:
         if isinstance(order_totals, list):
             order_totals_map = {
-                item['process_number']: item.get('order_total')
+                item["process_number"]: item.get("order_total")
                 for item in order_totals
-                if item.get('order_total') is not None
+                if item.get("order_total") is not None
             }
         elif isinstance(order_totals, dict):
             order_totals_map = {k: v for k, v in order_totals.items() if v is not None}
@@ -69,186 +79,161 @@ def classify_orders(
         "cxp_error_state": 0,
         "no_payment_data": 0,
         "payment_cancelled": 0,
+        "asn_not_settled": 0,
         "shipped_not_settled": 0,
         "declined": 0,
         "fraud": 0,
         "payment_success_order_failed": 0,
-        "data_inconsistencies": 0,
+        "settlement_anomaly": 0,
         "settlement_amount_mismatch": 0,
         "success_shipped_settled": 0,
         "success_ordered_approved": 0,
+        "verification_needed": 0,
         "failed_other": 0
     }
 
-    # ------------------------------------
+    # ──────────────────────────────────────────
     # First pass: classify each order
-    # ------------------------------------
+    # ──────────────────────────────────────────
     for order in cxp_orders:
-        order_id = order["process_number"]
-        email = order.get("notif_email")
-        phone = order.get("notify_mobile_no")
-        order_date = order.get("order_date")
+        order_id       = order["process_number"]
+        email          = order.get("notif_email")
+        phone          = order.get("notify_mobile_no")
+        order_date     = order.get("order_date")
+        cxp_status     = order.get("fulfillment_status")   # SHIPPED / ORDERED / CLAIMED / None
+        cxp_db_status  = order.get("order_state")          # SUCCESS / ERROR / PAYMENT_CANCELLED …
 
-        cxp_status = order.get("fulfillment_status")
-        cxp_db_status = order.get("order_state")
+        # Converge data
+        converge_info         = converge_invoices.get(order_id, {})
+        settled_info          = settled_invoices.get(order_id, {})
 
-        # Get Converge data
-        converge_info = converge_invoices.get(order_id, {})
-        settled_info = settled_invoices.get(order_id, {})
+        converge_status       = converge_info.get("final_status", "NA")
+        is_data_issue         = converge_info.get("is_data_issue", False)
+        is_settled            = settled_info.get("settled", False)
+        settled_amount        = settled_info.get("net_amount")        # sale - returns
+        has_settlement_anomaly = settled_info.get("has_anomaly", False)
 
-        converge_status = converge_info.get("final_status", "NA")
-        is_data_issue = converge_info.get("is_data_issue", False)
-        is_settled = settled_info.get("settled", False)
-        settled_amount = settled_info.get("net_amount")  # ✅ NEW
-        has_settlement_anomaly = settled_info.get("has_anomaly", False)  # ✅ NEW
+        # ASN & order total
+        has_asn     = order_id in asn_set
+        order_total = order_totals_map.get(order_id)
 
-        # Get order total
-        order_total = order_totals_map.get(order_id)  # ✅ NEW
+        state       = None
+        action_reason = None
 
-        state = None
-        risk_reason = None
-
-        # ===== PRIORITY 1: ERROR STATE =====
+        # ── PRIORITY 1: CXP ERROR STATE ──────────────────────────────
         if cxp_db_status == "ERROR":
-            state = "RISKY"
-            risk_reason = "CXP_ERROR_STATE"
+            state = "ACTION_REQUIRED"
+            action_reason = "CXP_ERROR_STATE"
             classification_stats["cxp_error_state"] += 1
 
-        # ===== PRIORITY 2: No payment data =====
-        elif cxp_db_status == "SUCCESS" and converge_status == "NA" and not is_settled and cxp_status in ("ORDERED", "CLAIMED"):
-            state = "RISKY"
-            risk_reason = "NO_PAYMENT_DATA"
+        # ── PRIORITY 2: No payment data ───────────────────────────────
+        elif (cxp_db_status == "SUCCESS"
+              and converge_status == "NA"
+              and not is_settled
+              and cxp_status in ("ORDERED", "CLAIMED")):
+            state = "ACTION_REQUIRED"
+            action_reason = "NO_PAYMENT_DATA"
             classification_stats["no_payment_data"] += 1
 
-        # ===== PRIORITY 3: PAYMENT CANCELLED =====
+        # ── PRIORITY 3: Payment cancelled → FAILED ────────────────────
         elif cxp_db_status == "PAYMENT_CANCELLED":
             state = "FAILED"
             classification_stats["payment_cancelled"] += 1
 
-        # ===== PRIORITY 4: Shipped but not settled =====
+        # ── PRIORITY 4: ASN received but NOT settled ──────────────────
+        #    Physical shipment went out — money MUST be settled
+        elif has_asn and not is_settled:
+            state = "ACTION_REQUIRED"
+            action_reason = "ASN_NOT_SETTLED"
+            classification_stats["asn_not_settled"] += 1
+
+        # ── PRIORITY 5: CXP=SHIPPED but not settled ───────────────────
+        # Note: we trust the settled flag over the auth message.
+        # If is_settled=True the order will reach Priority 9 (SUCCESS).
+        # DECLINED/FRAUD in the auth batch is a Converge data inconsistency
+        # that is irrelevant once settlement is confirmed.
         elif cxp_status == "SHIPPED" and not is_settled:
-            state = "RISKY"
-            risk_reason = "SHIPPED_NOT_SETTLED"
+            state = "ACTION_REQUIRED"
+            action_reason = "SHIPPED_NOT_SETTLED"
+            classification_stats["shipped_not_settled"] += 1
+            state = "ACTION_REQUIRED"
+            action_reason = "SHIPPED_NOT_SETTLED"
             classification_stats["shipped_not_settled"] += 1
 
-        # ===== PRIORITY 5: Bank declined / fraud =====
-        elif converge_status in ("DECLINED", "SUSPECTED FRAUD") or "DECLINED" in converge_status:
+        # ── PRIORITY 7: Payment approved but no CXP fulfillment status
+        elif not cxp_status and converge_status == "APPROVAL":
+            state = "ACTION_REQUIRED"
+            action_reason = "PAYMENT_SUCCESS_ORDER_FAILED"
+            classification_stats["payment_success_order_failed"] += 1
+
+        # ── PRIORITY 8: Settlement anomaly (dup SALEs / RETURN w/o SALE)
+        elif has_settlement_anomaly:
+            state = "ACTION_REQUIRED"
+            action_reason = "SETTLEMENT_ANOMALY"
+            classification_stats["settlement_anomaly"] += 1
+
+        # ── PRIORITY 9: SUCCESS – Shipped + Settled ───────────────────
+        elif cxp_status == "SHIPPED" and is_settled:
+            state, action_reason = _validate_amounts(
+                order_id, order_total, settled_amount,
+                "success_shipped_settled", "success_shipped_settled",
+                classification_stats, settlement_amount_mismatches, logger
+            )
+
+        # ── PRIORITY 10: SUCCESS – Ordered/Claimed + Approved ─────────
+        elif cxp_status in ("ORDERED", "CLAIMED") and converge_status == "APPROVAL":
+            if is_data_issue:
+                # Converge data inconsistency — still SUCCESS but flag it
+                state = "SUCCESS"
+                action_reason = "CONVERGE_DATA_INCONSISTENCY"
+                classification_stats["verification_needed"] += 1
+                converge_data_inconsistencies.append(order_id)
+            else:
+                state, action_reason = _validate_amounts(
+                    order_id, order_total, settled_amount,
+                    "success_ordered_approved", "success_ordered_approved",
+                    classification_stats, settlement_amount_mismatches, logger
+                )
+
+        # ── PRIORITY 11: DECLINED / FRAUD  → FAILED ──────────────────
+        elif "DECLINED" in converge_status or converge_status == "SUSPECTED FRAUD":
             state = "FAILED"
             if "FRAUD" in converge_status:
                 classification_stats["fraud"] += 1
             else:
                 classification_stats["declined"] += 1
 
-        # ===== PRIORITY 6: Payment success but order failed =====
-        elif not cxp_status and converge_status == "APPROVAL":
-            state = "RISKY"
-            risk_reason = "PAYMENT_SUCCESS_ORDER_FAILED"
-            classification_stats["payment_success_order_failed"] += 1
-
-        # ===== PRIORITY 7: Converge data inconsistency =====
-        elif is_data_issue:
-            state = "VERIFICATION_NEEDED"
-            risk_reason = "CONVERGE_DATA_INCONSISTENCY"
-            classification_stats["data_inconsistencies"] += 1
-            converge_data_inconsistencies.append(order_id)
-
-        # ✅ PRIORITY 8: Settlement anomaly
-        elif has_settlement_anomaly:
-            state = "RISKY"
-            risk_reason = f"SETTLEMENT_ANOMALY"
-            classification_stats["settlement_amount_mismatch"] += 1
-
-        # ===== PRIORITY 9: SUCCESS – Shipped + Settled (WITH AMOUNT VALIDATION) =====
-        elif cxp_status == "SHIPPED" and is_settled:
-            # ✅ VALIDATE SETTLEMENT AMOUNT
-            if order_total is not None and settled_amount is not None:
-                try:
-                    amount_diff = abs(float(settled_amount) - float(order_total))
-                    if amount_diff > 0.01:  # More than 1 cent difference
-                        state = "RISKY"
-                        risk_reason = "SETTLEMENT_AMOUNT_MISMATCH"
-                        classification_stats["settlement_amount_mismatch"] += 1
-                        settlement_amount_mismatches.append({
-                            "order_id": order_id,
-                            "order_total": float(order_total),
-                            "settled_amount": float(settled_amount),
-                            "difference": float(settled_amount) - float(order_total)
-                        })
-                        logger.warning(
-                            "Settlement mismatch: %s | Order=$%.2f | Settled=$%.2f | Diff=$%.2f",
-                            order_id, float(order_total), float(settled_amount), amount_diff
-                        )
-                    else:
-                        state = "SUCCESS"
-                        classification_stats["success_shipped_settled"] += 1
-                except (ValueError, TypeError) as e:
-                    logger.debug("Amount validation failed for %s: %s", order_id, e)
-                    state = "SUCCESS"
-                    classification_stats["success_shipped_settled"] += 1
-            else:
-                state = "SUCCESS"
-                classification_stats["success_shipped_settled"] += 1
-
-        # ===== PRIORITY 10: SUCCESS – Ordered/Claimed + Approval (WITH AMOUNT VALIDATION) =====
-        elif cxp_status in ("ORDERED", "CLAIMED") and converge_status == "APPROVAL":
-            # ✅ CHECK AMOUNT IF SETTLED
-            if is_settled and order_total is not None and settled_amount is not None:
-                try:
-                    amount_diff = abs(float(settled_amount) - float(order_total))
-                    if amount_diff > 0.01:
-                        state = "RISKY"
-                        risk_reason = "SETTLEMENT_AMOUNT_MISMATCH"
-                        classification_stats["settlement_amount_mismatch"] += 1
-                        settlement_amount_mismatches.append({
-                            "order_id": order_id,
-                            "order_total": float(order_total),
-                            "settled_amount": float(settled_amount),
-                            "difference": float(settled_amount) - float(order_total)
-                        })
-                        logger.warning(
-                            "Settlement mismatch: %s | Order=$%.2f | Settled=$%.2f | Diff=$%.2f",
-                            order_id, float(order_total), float(settled_amount), amount_diff
-                        )
-                    else:
-                        state = "SUCCESS"
-                        classification_stats["success_ordered_approved"] += 1
-                except (ValueError, TypeError) as e:
-                    logger.debug("Amount validation failed for %s: %s", order_id, e)
-                    state = "SUCCESS"
-                    classification_stats["success_ordered_approved"] += 1
-            else:
-                state = "SUCCESS"
-                classification_stats["success_ordered_approved"] += 1
-
-        # ===== DEFAULT: Everything else = FAILED =====
+        # ── DEFAULT: everything else FAILED ───────────────────────────
         else:
             state = "FAILED"
             classification_stats["failed_other"] += 1
 
-        # Store classification result
+        # Store result
         orders_result[order_id] = {
             "state": state,
-            "risk_reason": risk_reason,
+            "action_reason": action_reason,
             "cxp_status": cxp_status,
             "cxp_db_status": cxp_db_status,
             "converge_status": converge_status,
             "is_settled": is_settled,
-            "settled_amount": settled_amount,  # ✅ NEW
-            "order_total": order_total,  # ✅ NEW
+            "settled_amount": settled_amount,
+            "order_total": order_total,
             "is_data_issue": is_data_issue,
+            "has_asn": has_asn,
             "is_retry_success": False,
-            "order_date": order_date
+            "order_date": order_date,
+            "email": email,
+            "phone": phone
         }
 
-        # Categorize
         if state == "SUCCESS":
             successful_orders.append(order_id)
         elif state == "FAILED":
             failed_orders.add(order_id)
-        elif state == "RISKY":
+        elif state == "ACTION_REQUIRED":
             action_required_orders.append(order_id)
-        elif state == "VERIFICATION_NEEDED":
-            successful_orders.append(order_id)
+        # VERIFICATION_NEEDED is no longer a separate state —
+        # converge data inconsistency goes to SUCCESS with action_reason tag
 
         # Track for retry detection
         customer_key = email or phone
@@ -260,131 +245,92 @@ def classify_orders(
                 "converge_status": converge_status
             })
 
-    # ------------------------------------
-    # Second pass: ✅ IMPROVED retry detection
-    # ------------------------------------
+    # ──────────────────────────────────────────
+    # Second pass: retry detection
+    # A "retry success" is: same customer, earlier FAILED or ACTION_REQUIRED
+    # attempt followed by a SUCCESS attempt within 7 days.
+    # ──────────────────────────────────────────
     for customer, attempts in customer_history.items():
         if len(attempts) < 2:
             continue
 
-        # ✅ Sort by order date
         try:
-            sorted_attempts = sorted(attempts, key=lambda x: x.get("order_date") or "")
-        except (TypeError, KeyError):
-            logger.debug("Could not sort attempts for customer %s", customer[:20])
+            sorted_attempts = sorted(
+                attempts,
+                key=lambda x: _to_datetime(x.get("order_date")) or datetime.min
+            )
+        except Exception:
             continue
 
-        # ✅ Look for FAILED followed by SUCCESS pattern
         for i in range(len(sorted_attempts) - 1):
-            current = sorted_attempts[i]
+            current      = sorted_attempts[i]
             next_attempt = sorted_attempts[i + 1]
 
-            # Check if current failed and next succeeded
-            if current["state"] == "FAILED" and next_attempt["state"] == "SUCCESS":
-                # Verify it's within reasonable time window
+            # Previous must be FAILED or ACTION_REQUIRED; next must be SUCCESS
+            if (current["state"] in ("FAILED", "ACTION_REQUIRED")
+                    and next_attempt["state"] == "SUCCESS"):
                 try:
-                    current_date = current.get("order_date")
-                    next_date = next_attempt.get("order_date")
+                    cur_dt  = _to_datetime(current["order_date"])
+                    next_dt = _to_datetime(next_attempt["order_date"])
 
-                    if current_date and next_date:
-                        # Parse dates if they're strings
-                        if isinstance(current_date, str):
-                            current_date = datetime.fromisoformat(current_date.replace('Z', '+00:00'))
-                        if isinstance(next_date, str):
-                            next_date = datetime.fromisoformat(next_date.replace('Z', '+00:00'))
-
-                        # Check time difference (within 7 days)
-                        if isinstance(current_date, datetime) and isinstance(next_date, datetime):
-                            time_diff = (next_date - current_date).days
-
-                            if 0 <= time_diff <= 7:
-                                order_id = next_attempt["order_id"]
-                                orders_result[order_id]["is_retry_success"] = True
-                                orders_result[order_id]["previous_failed_attempt"] = current["order_id"]
-                                retry_success_orders.append(order_id)
-
-                                logger.info(
-                                    "Retry success: Customer=%s | Failed=%s | Success=%s | Days=%s",
-                                    customer[:30], current["order_id"], order_id, time_diff
-                                )
-                        else:
-                            # If dates aren't datetime objects, still mark as retry but log warning
-                            order_id = next_attempt["order_id"]
-                            orders_result[order_id]["is_retry_success"] = True
-                            retry_success_orders.append(order_id)
-                            logger.debug("Retry detected but couldn't verify time window for %s", order_id)
+                    if cur_dt and next_dt:
+                        diff_days = (next_dt - cur_dt).days
+                        if 0 <= diff_days <= 7:
+                            oid = next_attempt["order_id"]
+                            orders_result[oid]["is_retry_success"] = True
+                            orders_result[oid]["previous_failed_attempt"] = current["order_id"]
+                            retry_success_orders.append(oid)
+                            logger.info(
+                                "Retry success: Customer=%s | Failed=%s | Success=%s | Days=%s",
+                                customer[:30], current["order_id"], oid, diff_days
+                            )
                 except Exception as e:
                     logger.debug("Error processing retry for customer %s: %s", customer[:20], e)
-                    continue
 
-    # ------------------------------------
-    # ✅ SUMMARY LOGGING (instead of every order)
-    # ------------------------------------
+    # ──────────────────────────────────────────
+    # Summary logging
+    # ──────────────────────────────────────────
     logger.info("=" * 60)
     logger.info("CLASSIFICATION COMPLETED")
     logger.info("=" * 60)
-    logger.info("Total Orders:          %s", classification_stats["total"])
-    logger.info("Success:               %s", len(successful_orders))
-    logger.info("  - Shipped+Settled:   %s", classification_stats["success_shipped_settled"])
-    logger.info("  - Ordered+Approved:  %s", classification_stats["success_ordered_approved"])
-    logger.info("Failed:                %s", len(failed_orders))
-    logger.info("  - Declined:          %s", classification_stats["declined"])
-    logger.info("  - Fraud:             %s", classification_stats["fraud"])
-    logger.info("  - Payment Cancelled: %s", classification_stats["payment_cancelled"])
-    logger.info("  - Other:             %s", classification_stats["failed_other"])
-    logger.info("Risky (Action Req):    %s", len(action_required_orders))
-    logger.info("  - CXP Error:         %s", classification_stats["cxp_error_state"])
-    logger.info("  - No Payment Data:   %s", classification_stats["no_payment_data"])
-    logger.info("  - Shipped Not Settled: %s", classification_stats["shipped_not_settled"])
+    logger.info("Total Orders:                  %s", classification_stats["total"])
+    logger.info("Success:                       %s", len(successful_orders))
+    logger.info("  - Shipped + Settled:         %s", classification_stats["success_shipped_settled"])
+    logger.info("  - Ordered + Approved:        %s", classification_stats["success_ordered_approved"])
+    logger.info("  - Verification (data issue): %s", classification_stats["verification_needed"])
+    logger.info("Failed:                        %s", len(failed_orders))
+    logger.info("  - Declined:                  %s", classification_stats["declined"])
+    logger.info("  - Fraud:                     %s", classification_stats["fraud"])
+    logger.info("  - Payment Cancelled:         %s", classification_stats["payment_cancelled"])
+    logger.info("  - Other:                     %s", classification_stats["failed_other"])
+    logger.info("Action Required:               %s", len(action_required_orders))
+    logger.info("  - CXP Error:                 %s", classification_stats["cxp_error_state"])
+    logger.info("  - No Payment Data:           %s", classification_stats["no_payment_data"])
+    logger.info("  - ASN Not Settled:           %s", classification_stats["asn_not_settled"])
+    logger.info("  - Shipped Not Settled:       %s", classification_stats["shipped_not_settled"])
     logger.info("  - Payment Success Order Failed: %s", classification_stats["payment_success_order_failed"])
-    logger.info("  - Settlement Mismatch: %s", classification_stats["settlement_amount_mismatch"])
-    logger.info("Verification Needed:   %s", len(converge_data_inconsistencies))
-    logger.info("Retry Successes:       %s", len(retry_success_orders))
+    logger.info("  - Settlement Anomaly:        %s", classification_stats["settlement_anomaly"])
+    logger.info("  - Settlement Amount Mismatch:%s", classification_stats["settlement_amount_mismatch"])
+    logger.info("Retry Successes:               %s", len(retry_success_orders))
     logger.info("=" * 60)
 
-    # ✅ Log action required items with grouped reasons
-    # ✅ Log action required items with grouped reasons + order IDs
     if action_required_orders:
-        risk_reason_summary = {}
-        risk_reason_orders = {}
+        reason_summary = defaultdict(list)
+        for oid in action_required_orders:
+            reason = orders_result[oid].get("action_reason", "UNKNOWN")
+            reason_summary[reason].append(oid)
 
-        for order_id in action_required_orders:
-            reason = orders_result[order_id].get("risk_reason", "UNKNOWN")
+        logger.warning("⚠️  %s orders require attention:", len(action_required_orders))
+        for reason, oids in sorted(reason_summary.items(), key=lambda x: -len(x[1])):
+            logger.warning("  - %s: %s orders | [%s]", reason, len(oids), ", ".join(oids))
 
-            # count per reason
-            risk_reason_summary[reason] = risk_reason_summary.get(reason, 0) + 1
-
-            # collect order ids per reason
-            risk_reason_orders.setdefault(reason, []).append(order_id)
-
-        logger.warning("⚠️ %s orders require attention:", len(action_required_orders))
-
-        for reason, count in sorted(
-                risk_reason_summary.items(),
-                key=lambda x: x[1],
-                reverse=True
-        ):
-            order_ids = ", ".join(map(str, risk_reason_orders.get(reason, [])))
-            logger.warning(
-                "  - %s: %s orders | order_ids=[%s]",
-                reason,
-                count,
-                order_ids
-            )
-
-    # ✅ Log settlement mismatches details
     if settlement_amount_mismatches:
-        logger.warning("⚠️ %s SETTLEMENT AMOUNT MISMATCHES:", len(settlement_amount_mismatches))
-        for mismatch in settlement_amount_mismatches[:5]:  # Show first 5
+        logger.warning("⚠️  %s SETTLEMENT AMOUNT MISMATCHES:", len(settlement_amount_mismatches))
+        for m in settlement_amount_mismatches[:5]:
             logger.warning(
-                "  - %s: Order=$%.2f vs Settled=$%.2f (Diff=$%.2f)",
-                mismatch['order_id'],
-                mismatch['order_total'],
-                mismatch['settled_amount'],
-                abs(mismatch['difference'])
+                "  - %s: Order=%.2f | Settled=%.2f | Diff=%.2f",
+                m["order_id"], m["order_total"], m["settled_amount"], abs(m["difference"])
             )
-        if len(settlement_amount_mismatches) > 5:
-            logger.warning("  ... and %s more", len(settlement_amount_mismatches) - 5)
 
     return {
         "orders": orders_result,
@@ -393,6 +339,63 @@ def classify_orders(
         "action_required_orders": action_required_orders,
         "retry_success_orders": retry_success_orders,
         "converge_data_inconsistencies": converge_data_inconsistencies,
-        "settlement_amount_mismatches": settlement_amount_mismatches,  # ✅ NEW
-        "classification_stats": classification_stats  # ✅ NEW
+        "settlement_amount_mismatches": settlement_amount_mismatches,
+        "classification_stats": classification_stats
     }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _to_datetime(value) -> Optional[datetime]:
+    """Safely coerce order_date to datetime regardless of input type."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day)
+    if isinstance(value, str):
+        for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S",
+                    "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(value.split("+")[0].rstrip("Z"), fmt.rstrip("%z"))
+            except ValueError:
+                continue
+    return None
+
+
+def _validate_amounts(order_id, order_total, settled_amount,
+                      success_stat_key, _unused,
+                      classification_stats, settlement_amount_mismatches, log) -> tuple:
+    """
+    Compare settled_amount vs order_total.
+    Returns (state, action_reason).
+    """
+    if order_total is not None and settled_amount is not None:
+        try:
+            diff = abs(float(settled_amount) - float(order_total))
+            if diff > 0.01:
+                classification_stats["settlement_amount_mismatch"] += 1
+                settlement_amount_mismatches.append({
+                    "order_id": order_id,
+                    "order_total": float(order_total),
+                    "settled_amount": float(settled_amount),
+                    "difference": float(settled_amount) - float(order_total)
+                })
+                log.warning(
+                    "Settlement mismatch: %s | Order=%.2f | Settled=%.2f | Diff=%.2f",
+                    order_id, float(order_total), float(settled_amount), diff
+                )
+                return "ACTION_REQUIRED", "SETTLEMENT_AMOUNT_MISMATCH"
+            else:
+                classification_stats[success_stat_key] += 1
+                return "SUCCESS", None
+        except (ValueError, TypeError) as e:
+            log.debug("Amount validation failed for %s: %s", order_id, e)
+            classification_stats[success_stat_key] += 1
+            return "SUCCESS", None
+    else:
+        classification_stats[success_stat_key] += 1
+        return "SUCCESS", None
