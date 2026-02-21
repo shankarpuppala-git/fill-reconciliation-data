@@ -185,13 +185,20 @@ class ReconciliationWorkbookWriter:
     def create_orders_shipped_sheet(
         self,
         asn_process_numbers: list,
-        order_totals: list,
-        converge_settled: dict
+        asn_order_totals: list,
+        converge_settled: dict,
+        classification: dict
     ):
         """
-        ASN process numbers come from fetch_asn_process_numbers DB query.
-        Order totals come from fetch_order_totals DB query.
-        Compares every ASN order against what settled in Converge.
+        Flow:
+          Query 3 → fetch_asn_process_numbers  → asn_process_numbers  → Column A / E
+          Query 4 → fetch_order_totals(ASN ids) → asn_order_totals     → Column B
+          Converge Settled batch                                         → Column F
+          Compare B vs F:
+            - Match (diff <= 0.01)  → Differences = "NO",  no highlight
+            - Mismatch (diff > 0.01)→ Differences = amount, red row → ACTION REQUIRED
+            - Not in Converge       → Differences = "NOT IN CONVERGE", red row → ACTION REQUIRED
+            - CXP total missing     → Column B blank, yellow row (data gap)
         """
         sheet = self.workbook.create_sheet("Orders Shipped")
 
@@ -207,10 +214,11 @@ class ReconciliationWorkbookWriter:
             self._auto_fit_columns(sheet)
             return
 
-        # Build CXP order total map — order_totals is a list of
-        # {process_number, order_total} dicts from fetch_order_totals
+        # Build CXP order total map from Query 4 results.
+        # Key = process_number (normalised), Value = order_total from DB.
+        # asn_order_totals is fetch_order_totals(asn_process_numbers) — ASN ids only.
         order_total_map = {}
-        for item in (order_totals or []):
+        for item in (asn_order_totals or []):
             pnum  = item.get("process_number")
             total = item.get("order_total")
             if pnum and total is not None:
@@ -218,7 +226,7 @@ class ReconciliationWorkbookWriter:
 
         settled_invoices = converge_settled.get("invoice_level", {})
 
-        # Settled amount: use first SALE row (confirmed correct by user)
+        # Settled amount — first SALE row per invoice (user confirmed correct)
         settled_amount_map = {}
         for invoice, data in settled_invoices.items():
             for raw_row in data.get("raw_rows", []):
@@ -226,42 +234,61 @@ class ReconciliationWorkbookWriter:
                     settled_amount_map[invoice] = raw_row.get("amount")
                     break
 
+        # Build action_required set for quick lookup (already flagged by classifier)
+        action_required_set = set(classification.get("action_required_orders", []))
+
         row_num = 2
         for order_id in asn_process_numbers:
             oid_str         = str(order_id).strip()
-            cxp_amount      = order_total_map.get(oid_str)
-            converge_amount = settled_amount_map.get(oid_str)
+            cxp_amount      = order_total_map.get(oid_str)      # Column B — from DB (Query 4)
+            converge_amount = settled_amount_map.get(oid_str)   # Column F — from Converge settled
             is_in_converge  = oid_str in settled_invoices
             matching_status = "YES" if is_in_converge else "NO"
 
             difference = ""
-            if cxp_amount is not None and converge_amount is not None:
+            needs_action = oid_str in action_required_set
+
+            if not is_in_converge:
+                # Shipped but not in Converge settled — critical gap
+                difference   = "NOT IN CONVERGE"
+                needs_action = True
+            elif cxp_amount is not None and converge_amount is not None:
                 try:
-                    diff = abs(float(cxp_amount) - float(converge_amount))
-                    difference = f"{diff:.2f}" if diff > 0.01 else "NO"
+                    diff_val = abs(float(cxp_amount) - float(converge_amount))
+                    if diff_val > 0.01:
+                        difference   = f"{diff_val:.2f}"
+                        needs_action = True
+                    else:
+                        difference = "NO"   # amounts match — no issue
                 except (TypeError, ValueError):
                     difference = "ERROR"
-            elif not is_in_converge:
-                difference = "NOT IN CONVERGE"
+            elif cxp_amount is None and is_in_converge:
+                # In Converge but DB total missing — data gap, yellow highlight
+                difference = ""
 
             sheet.append([
                 oid_str,
-                cxp_amount,
+                cxp_amount,          # blank if DB total not found — shows gap clearly
                 matching_status,
                 difference,
                 oid_str,
                 converge_amount if converge_amount is not None else "NA"
             ])
 
-            if matching_status == "NO" or (difference and difference not in ("NO", "")):
+            if not is_in_converge or (difference and difference not in ("NO", "")):
+                # Red = action required (missing from Converge or amount mismatch)
                 self._apply_row_fill(sheet, row_num, len(headers), "FFC7CE")
                 if not is_in_converge:
                     try:
                         sheet.cell(row=row_num, column=3).comment = Comment(
-                            "Order in ASN but not in Settled batch", "Reconciliation"
+                            "Shipped (ASN received) but payment not settled in Converge",
+                            "Reconciliation"
                         )
                     except Exception:
                         pass
+            elif cxp_amount is None and is_in_converge:
+                # Yellow = data gap — in Converge but CXP total missing from DB
+                self._apply_row_fill(sheet, row_num, len(headers), "FFEB9C")
 
             row_num += 1
 
@@ -530,6 +557,7 @@ class ReconciliationWorkbookWriter:
         sales_orders: list,
         order_items: list,
         asn_process_numbers: list,
+        asn_order_totals: list,
         order_totals: list,
         classification: dict,
         converge_current_result: dict,
@@ -580,14 +608,23 @@ class ReconciliationWorkbookWriter:
 
         # ── B: DB Query Counts ────────────────────────────────────────────────
         r = hdr(r, "Database Query Results")
-        r = kv(r, "Sales Orders fetched",       len(sales_orders))
-        r = kv(r, "Order Items fetched",         len(order_items))
-        r = kv(r, "ASN Process Numbers fetched", len(asn_process_numbers))
-        r = kv(r, "Order Totals fetched",        len(order_totals))
+        r = kv(r, "Q1 — Sales Orders fetched",              len(sales_orders))
+        r = kv(r, "Q2 — Order Items fetched",               len(order_items))
+        r = kv(r, "Q3 — ASN Process Numbers fetched",       len(asn_process_numbers))
+        r = kv(r, "Q4 — ASN Order Totals fetched (from DB)",len(asn_order_totals))
+
+        asn_with_totals = sum(1 for i in asn_order_totals if i.get("order_total") is not None)
+        asn_pct = (
+            f"{asn_with_totals}/{len(asn_process_numbers)} "
+            f"({asn_with_totals / len(asn_process_numbers) * 100:.1f}%)"
+            if asn_process_numbers else "0/0"
+        )
+        r = kv(r, "ASN Orders with CXP Total", asn_pct)
 
         orders_with_totals = sum(1 for i in order_totals if i.get("order_total") is not None)
         pct = f"{orders_with_totals / len(sales_orders) * 100:.1f}%" if sales_orders else "0%"
-        r = kv(r, "Order Total Coverage", f"{orders_with_totals}/{len(sales_orders)} ({pct})")
+        r = kv(r, "All Orders Total Coverage",
+               f"{orders_with_totals}/{len(sales_orders)} ({pct})")
         r += 1
 
         # ── C: Converge Batch Stats ───────────────────────────────────────────

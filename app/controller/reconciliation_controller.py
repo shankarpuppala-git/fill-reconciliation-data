@@ -187,10 +187,18 @@ async def run_reconciliation(
     converge_current_rows = read_csv(current_batch_csv, "Converge CURRENT batch")
     converge_settled_rows = read_csv(settled_batch_csv, "Converge SETTLED batch")
 
-    # ASN process numbers — fetched from DB (fetch_asn_process_numbers query)
+    # Query 3: ASN process numbers — orders the warehouse physically shipped
     asn_rows_raw        = db_queries.fetch_asn_process_numbers(start_date, end_date)
     asn_process_numbers = [r["process_number"] for r in asn_rows_raw]
     logger.info("✓ ASN process numbers fetched from DB | count=%s", len(asn_process_numbers))
+
+    # Query 4: Order totals specifically for ASN orders (ASN numbers are the input).
+    # We need the CXP order_total for each shipped order to compare against
+    # what Converge settled. This is a separate fetch from order_totals_raw
+    # (which serves the classifier) — scope is ASN orders only.
+    asn_order_totals = db_queries.fetch_order_totals(asn_process_numbers) if asn_process_numbers else []
+    logger.info("✓ ASN order totals fetched | count=%s/%s",
+                len(asn_order_totals), len(asn_process_numbers))
 
     # =====================================================
     # STEP 4: RUN RECONCILIATION SERVICE
@@ -280,11 +288,14 @@ async def run_reconciliation(
         # Sheet 4: Converge SETTLED
         writer.create_converge_settled_sheet(converge_settled_rows)
 
-        # Sheet 5: Orders Shipped (ASN from DB vs Converge settled)
+        # Sheet 5: Orders Shipped
+        # asn_order_totals = fetch_order_totals(asn_process_numbers) — Query 4
+        # Scope is ASN orders only, not all sales orders.
         writer.create_orders_shipped_sheet(
             asn_process_numbers=asn_process_numbers,
-            order_totals=order_totals_raw,
-            converge_settled=converge_settled_result
+            asn_order_totals=asn_order_totals,
+            converge_settled=converge_settled_result,
+            classification=classification
         )
 
         # Sheet 6: Logs (everything that would have gone to the log file)
@@ -294,6 +305,7 @@ async def run_reconciliation(
             sales_orders=sales_orders,
             order_items=order_items,
             asn_process_numbers=asn_process_numbers,
+            asn_order_totals=asn_order_totals,
             order_totals=order_totals_raw,
             classification=classification,
             converge_current_result=converge_current_result,
