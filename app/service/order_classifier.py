@@ -54,6 +54,7 @@ def classify_orders(
     retry_success_orders = []
     converge_data_inconsistencies = []
     settlement_amount_mismatches = []
+    settled_no_asn_orders = []          # Settled in Converge but no ASN record — info only
 
     customer_history = defaultdict(list)
 
@@ -86,6 +87,7 @@ def classify_orders(
         "payment_success_order_failed": 0,
         "settlement_anomaly": 0,
         "settlement_amount_mismatch": 0,
+        "settled_no_asn": 0,
         "success_shipped_settled": 0,
         "success_ordered_approved": 0,
         "verification_needed": 0,
@@ -156,9 +158,6 @@ def classify_orders(
             state = "ACTION_REQUIRED"
             action_reason = "SHIPPED_NOT_SETTLED"
             classification_stats["shipped_not_settled"] += 1
-            state = "ACTION_REQUIRED"
-            action_reason = "SHIPPED_NOT_SETTLED"
-            classification_stats["shipped_not_settled"] += 1
 
         # ── PRIORITY 7: Payment approved but no CXP fulfillment status
         elif not cxp_status and converge_status == "APPROVAL":
@@ -173,7 +172,11 @@ def classify_orders(
             classification_stats["settlement_anomaly"] += 1
 
         # ── PRIORITY 9: SUCCESS – Shipped + Settled ───────────────────
-        elif cxp_status == "SHIPPED" and is_settled:
+        # Condition: CXP says SHIPPED *or* order is in ASN (authoritative
+        # for physical shipment) AND payment is settled in Converge.
+        # Using `has_asn` catches orders whose pzv_sales_order_item record
+        # was not yet updated to SHIPPED but the warehouse already sent ASN.
+        elif (cxp_status == "SHIPPED" or has_asn) and is_settled:
             state, action_reason = _validate_amounts(
                 order_id, order_total, settled_amount,
                 "success_shipped_settled", "success_shipped_settled",
@@ -208,6 +211,19 @@ def classify_orders(
             state = "FAILED"
             classification_stats["failed_other"] += 1
 
+        # Detect vice-versa: settled in Converge but no ASN record.
+        # If Converge collected payment AND cxp_status is SHIPPED but the
+        # warehouse sent no ASN — we cannot confirm the order was physically
+        # shipped. This is ACTION_REQUIRED with reason SETTLED_NO_ASN.
+        # Note: this block runs AFTER the main priority chain, so it only
+        # overrides if the order already reached SUCCESS (P9/P10).
+        # If it was already ACTION_REQUIRED for another reason, keep that reason.
+        settled_no_asn = (is_settled and not has_asn and cxp_status == "SHIPPED")
+        if settled_no_asn and state == "SUCCESS":
+            state = "ACTION_REQUIRED"
+            action_reason = "SETTLED_NO_ASN"
+            classification_stats["settled_no_asn"] = classification_stats.get("settled_no_asn", 0) + 1
+
         # Store result
         orders_result[order_id] = {
             "state": state,
@@ -220,6 +236,7 @@ def classify_orders(
             "order_total": order_total,
             "is_data_issue": is_data_issue,
             "has_asn": has_asn,
+            "settled_no_asn": settled_no_asn,
             "is_retry_success": False,
             "order_date": order_date,
             "email": email,
@@ -232,6 +249,14 @@ def classify_orders(
             failed_orders.add(order_id)
         elif state == "ACTION_REQUIRED":
             action_required_orders.append(order_id)
+
+        if settled_no_asn:
+            settled_no_asn_orders.append(order_id)
+            logger.warning(
+                "⚠ Settled but NO ASN: %s — Converge collected payment but no "
+                "warehouse ASN record. Verify the order was physically shipped.",
+                order_id
+            )
         # VERIFICATION_NEEDED is no longer a separate state —
         # converge data inconsistency goes to SUCCESS with action_reason tag
 
@@ -332,6 +357,14 @@ def classify_orders(
                 m["order_id"], m["order_total"], m["settled_amount"], abs(m["difference"])
             )
 
+    if settled_no_asn_orders:
+        logger.warning(
+            "⚠ %s orders settled in Converge but have NO ASN record — "
+            "verify all were physically shipped: %s",
+            len(settled_no_asn_orders),
+            ", ".join(settled_no_asn_orders[:10])
+        )
+
     return {
         "orders": orders_result,
         "successful_orders": successful_orders,
@@ -340,6 +373,7 @@ def classify_orders(
         "retry_success_orders": retry_success_orders,
         "converge_data_inconsistencies": converge_data_inconsistencies,
         "settlement_amount_mismatches": settlement_amount_mismatches,
+        "settled_no_asn_orders": settled_no_asn_orders,
         "classification_stats": classification_stats
     }
 

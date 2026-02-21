@@ -259,13 +259,16 @@ async def run_reconciliation(
         writer = ReconciliationWorkbookWriter(start_date)
 
         # Sheet 1: Reconciliation (first tab)
+        # asn_order_totals passed separately so Section 2 can compare amounts
+        # for orders outside the CXP date window (e.g., ordered Monday, ASN Friday).
         writer.create_reconciliation_sheet(
             cxp_orders=sales_orders,
             classification=classification,
             converge_current=converge_current_result,
             converge_settled=converge_settled_result,
             asn_process_numbers=asn_process_numbers,
-            order_totals=order_totals_raw
+            order_totals=order_totals_raw,
+            asn_order_totals=asn_order_totals
         )
 
         # Sheet 2: CXP

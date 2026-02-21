@@ -253,6 +253,11 @@ def resolve_converge_settled(settled_rows: List[Dict[str, Any]]) -> Dict[str, An
         settled = sale_count > 0
 
         # Detect anomalies
+        # NOTE: RETURN_WITHOUT_SALE is intentionally NOT flagged as anomaly.
+        # A customer can return an order days/weeks later; the original SALE
+        # row will not appear in the current batch window.
+        # A RETURN-only invoice simply means a refund was processed — this is
+        # normal. It is tracked in stats (return_only_count) for info only.
         has_anomaly = False
         anomaly_reasons = []
 
@@ -261,9 +266,7 @@ def resolve_converge_settled(settled_rows: List[Dict[str, Any]]) -> Dict[str, An
             has_anomaly = True
             anomaly_reasons.append(f"MULTIPLE_SALES:{sale_count}")
 
-        if sale_count == 0 and return_count > 0:
-            has_anomaly = True
-            anomaly_reasons.append("RETURN_WITHOUT_SALE")
+        # sale_count==0 and return_count>0 → normal RETURN, NOT an anomaly
 
         if other_rows:
             has_anomaly = True
@@ -298,12 +301,23 @@ def resolve_converge_settled(settled_rows: List[Dict[str, Any]]) -> Dict[str, An
 
     logger.info("Converge SETTLED resolution completed")
 
+    return_only_count = sum(
+        1 for inv in resolved_invoices.values()
+        if inv["sale_count"] == 0 and inv["return_count"] > 0
+    )
+    if return_only_count > 0:
+        logger.info(
+            "%s RETURN-only invoices in batch (normal — refunds for earlier orders)",
+            return_only_count
+        )
+
     return {
         "invoice_level": resolved_invoices,
         "summary": summary_row,
         "stats": {
             "total_invoices": len(resolved_invoices),
             "settled_count": sum(1 for inv in resolved_invoices.values() if inv["settled"]),
+            "return_only_count": return_only_count,
             "anomaly_count": anomaly_count,
             "multiple_sales_count": multiple_sales_count
         }

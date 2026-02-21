@@ -307,7 +307,8 @@ class ReconciliationWorkbookWriter:
         converge_current: dict,
         converge_settled: dict,
         asn_process_numbers: list,
-        order_totals: list
+        order_totals: list,
+        asn_order_totals: list = None
     ):
         """
         6-section reconciliation report. Uses explicit sheet.cell(row, col)
@@ -328,6 +329,22 @@ class ReconciliationWorkbookWriter:
             total = item.get("order_total")
             if pnum and total is not None:
                 order_total_map[str(pnum).strip()] = total
+
+        # asn_total_map: order totals fetched specifically for ASN orders (Q4).
+        # These are fetched by process_number with no date filter on the ORDER,
+        # so they include orders placed outside the current date window (e.g.,
+        # ordered Monday, ASN logged Friday). This is the correct amount source
+        # for Section 2 — order_total_map only has orders in the CXP date window.
+        asn_total_map = {}
+        for item in (asn_order_totals or []):
+            pnum  = item.get("process_number")
+            total = item.get("order_total")
+            if pnum and total is not None:
+                asn_total_map[str(pnum).strip()] = total
+        # Fallback: for any ASN order not in asn_total_map, try order_total_map
+        for k, v in order_total_map.items():
+            if k not in asn_total_map:
+                asn_total_map[k] = v
 
         # ── Helpers ────────────────────────────────────────────────────────────
         def wr(row, values):
@@ -354,12 +371,11 @@ class ReconciliationWorkbookWriter:
 
         # ══════════════════════════════════════════════════════════════════════
         # SECTION 1 — Orders present in CXP but NOT in Converge
-        # Scope: fulfillment_status is ORDERED or CLAIMED (payment may still
-        #        arrive) or REJECTED (new scenario — included for visibility;
-        #        a rejected order may legitimately have no Converge record —
-        #        it will also appear in the Logs sheet for tracking).
-        # SHIPPED orders that are not in Converge settled belong in Section 4
-        #   (ASN_NOT_SETTLED / SHIPPED_NOT_SETTLED) — NOT here.
+        # Scope: fulfillment_status ORDERED or CLAIMED — payment expected but
+        #        zero presence in either Converge batch.
+        # SHIPPED orders not in Converge settled go to Section 4 (ASN_NOT_SETTLED).
+        # REJECTED: new scenario — included for visibility; a rejected order may
+        #           legitimately have no Converge record (also logged in Logs sheet).
         # Columns: Order # | Converge Status | CXP Status | Remarks
         # ══════════════════════════════════════════════════════════════════════
         r = section_hdr(r, "Orders present in CXP and not present in Converge")
@@ -402,12 +418,15 @@ class ReconciliationWorkbookWriter:
                     settled_amount_map[invoice] = raw_row.get("amount")
                     break
 
+        # Loop over ASN orders — not cxp_orders — because an order can be in
+        # ASN from a different day's date window (e.g., ordered Monday, ASN
+        # logged Friday). cxp_orders only has Friday's orders; asn_process_numbers
+        # has everything the warehouse shipped in this ASN window.
+        # Use asn_total_map (Q4, no date filter on order) for the CXP amount.
         sec2_written = False
-        for order in cxp_orders:
-            oid = order["process_number"]
-            if order.get("fulfillment_status") != "SHIPPED":
-                continue
-            cxp_amount      = order_total_map.get(oid)
+        for oid in asn_process_numbers:
+            oid = str(oid).strip()
+            cxp_amount      = asn_total_map.get(oid)
             converge_amount = settled_amount_map.get(oid)
             if cxp_amount is not None and converge_amount is not None:
                 try:
@@ -457,13 +476,9 @@ class ReconciliationWorkbookWriter:
 
         # ══════════════════════════════════════════════════════════════════════
         # SECTION 4 — Orders Shipped in CXP but Converge is NOT settled
-        # Catches two classifier reasons — both mean money not collected
-        # for a physically fulfilled order:
-        #
-        #   ASN_NOT_SETTLED     — warehouse shipped (ASN record exists) but
-        #                         no Converge settlement record → CRITICAL
-        #   SHIPPED_NOT_SETTLED — CXP says SHIPPED but not settled (no ASN)
-        #
+        # ASN_NOT_SETTLED    — ASN exists (warehouse shipped) but no settlement
+        # SHIPPED_NOT_SETTLED— CXP says SHIPPED but not settled (no ASN)
+        # Both are the same business problem: money not collected for shipped order.
         # Columns: Order # | CXP status | Converge Status | Remarks
         # ══════════════════════════════════════════════════════════════════════
         r = section_hdr(r, "Orders Shipped in CXP but converge is not settled")
@@ -660,22 +675,20 @@ class ReconciliationWorkbookWriter:
         cs = converge_settled_result.get("stats", {})
         total_inv      = cs.get("total_invoices", 0)
         settled_cnt    = cs.get("settled_count", 0)
-        return_only    = total_inv - settled_cnt        # invoices with RETURN but no SALE
+        return_only    = cs.get("return_only_count", 0)
         anomaly_cnt    = cs.get("anomaly_count", 0)
         multi_sale_cnt = cs.get("multiple_sales_count", 0)
 
         r = kv(r, "SETTLED — unique invoices",
                f"{total_inv}  (= {settled_cnt} with SALE  +  {return_only} RETURN-only)")
-        r = kv(r, "SETTLED — invoices with SALE row (settled = True)",  settled_cnt)
-        r = kv(r, "SETTLED — RETURN-only invoices (no SALE row)",       return_only)
-        r = kv(r, "SETTLED — anomaly count",    anomaly_cnt)
+        r = kv(r, "SETTLED — invoices with SALE (settled = True)",   settled_cnt)
+        r = kv(r, "SETTLED — RETURN-only invoices (normal — refunds for prior orders)", return_only)
+        r = kv(r, "SETTLED — anomaly count (MULTIPLE_SALES or NON_STANDARD only)", anomaly_cnt)
         r = kv(r, "SETTLED — multiple SALE rows", multi_sale_cnt)
-        r = kv(r,
-               "What is a Settlement Anomaly?",
-               "RETURN_WITHOUT_SALE: Converge has a refund (RETURN) for this invoice "
-               "but no original SALE row — money was returned with no payment on record "
-               "in this batch. Also flags MULTIPLE_SALES (duplicate SALE rows for same "
-               "invoice) and NON_STANDARD transaction types.")
+        r = kv(r, "What is a Settlement Anomaly?",
+               "MULTIPLE_SALES: same invoice has 2+ SALE rows in Converge (duplicate charge risk). "
+               "NON_STANDARD_TYPES: unexpected transaction type. "
+               "RETURN-only invoices are NOT anomalies — normal refund for an earlier order.")
         r += 1
 
         # ── D: Classification Summary ─────────────────────────────────────────
@@ -696,6 +709,7 @@ class ReconciliationWorkbookWriter:
                   stats.get("payment_success_order_failed", 0))
         r = kv(r, "Action Required — Settlement Anomaly",  stats.get("settlement_anomaly", 0))
         r = kv(r, "Action Required — Amount Mismatch",     stats.get("settlement_amount_mismatch", 0))
+        r = kv(r, "Action Required — Settled but No ASN",  stats.get("settled_no_asn", 0))
         r = kv(r, "Retry Successes",                       len(classification.get("retry_success_orders", [])))
         r += 1
 
@@ -768,7 +782,35 @@ class ReconciliationWorkbookWriter:
 
         r += 1
 
-        # ── G: Retry Successes ────────────────────────────────────────────────
+        # ── G: ACTION REQUIRED — Settled in Converge but NO ASN ────────────
+        # These orders are in action_required_orders with reason SETTLED_NO_ASN.
+        # Payment was collected but the warehouse sent no ASN — confirm shipment.
+        settled_no_asn_ids = classification.get("settled_no_asn_orders", [])
+        r = hdr(r, f"ACTION REQUIRED — Settled but NO ASN Record ({len(settled_no_asn_ids)})")
+
+        if settled_no_asn_ids:
+            wr(r, ["Order ID", "CXP Status", "Converge Status", "Warning"])
+            self._apply_sub_header_style(sheet, r, 4)
+            r += 1
+            orders_dict_logs = classification.get("orders", {})
+            for oid in settled_no_asn_ids:
+                od = orders_dict_logs.get(oid, {})
+                wr(r, [
+                    oid,
+                    od.get("cxp_status", ""),
+                    od.get("converge_status", "NA"),
+                    "Payment settled but no ASN record — verify order was physically shipped"
+                ])
+                self._apply_row_fill(sheet, r, 4, "FFEB9C")
+                r += 1
+        else:
+            sheet.cell(row=r, column=1).value = "✓ All settled orders have a matching ASN record — no action needed"
+            sheet.cell(row=r, column=1).font  = Font(bold=True, color="375623")
+            r += 1
+
+        r += 1
+
+        # ── H: Retry Successes ────────────────────────────────────────────────
         retry_ids = classification.get("retry_success_orders", [])
         r = hdr(r, f"Retry Successes ({len(retry_ids)})")
 
@@ -794,12 +836,14 @@ class ReconciliationWorkbookWriter:
 
     # ================= HELPER METHODS =================
     def _apply_borders(self, sheet):
-        """Apply thin border to every non-merged cell that has content."""
+        """Apply thin border to every non-merged cell."""
+        from openpyxl.styles import Border, Side
         thin   = Side(style="thin")
         border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        from openpyxl.cell.cell import MergedCell as MC
         for row in sheet.iter_rows():
             for cell in row:
-                if isinstance(cell, MergedCell):
+                if isinstance(cell, MC):
                     continue
                 cell.border = border
 
