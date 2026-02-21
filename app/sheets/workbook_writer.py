@@ -90,6 +90,7 @@ class ReconciliationWorkbookWriter:
 
             row_num += 1
 
+        self._apply_borders(sheet)
         self._auto_fit_columns(sheet)
 
     # ================= SHEET 2: CONVERGE WITH HIGHLIGHTING =================
@@ -146,6 +147,7 @@ class ReconciliationWorkbookWriter:
 
             row_num += 1
 
+        self._apply_borders(sheet)
         self._auto_fit_columns(sheet)
 
     # ================= SHEET 3: CONVERGE SETTLED WITH HIGHLIGHTING =================
@@ -179,6 +181,7 @@ class ReconciliationWorkbookWriter:
 
             row_num += 1
 
+        self._apply_borders(sheet)
         self._auto_fit_columns(sheet)
 
     # ================= SHEET 4: ORDERS SHIPPED =================
@@ -211,6 +214,7 @@ class ReconciliationWorkbookWriter:
 
         if not asn_process_numbers:
             sheet.append(["No ASN orders found for this period."])
+            self._apply_borders(sheet)
             self._auto_fit_columns(sheet)
             return
 
@@ -292,6 +296,7 @@ class ReconciliationWorkbookWriter:
 
             row_num += 1
 
+        self._apply_borders(sheet)
         self._auto_fit_columns(sheet)
 
     # ================= SHEET 5: RECONCILIATION =================
@@ -349,28 +354,34 @@ class ReconciliationWorkbookWriter:
 
         # ══════════════════════════════════════════════════════════════════════
         # SECTION 1 — Orders present in CXP but NOT in Converge
-        # Only orders where order_state == "SUCCESS" but zero Converge presence.
-        # WAITING_FOR_PAYMENT / PAYMENT_CANCELLED / ERROR are excluded.
+        # Scope: fulfillment_status is ORDERED or CLAIMED (payment may still
+        #        arrive) or REJECTED (new scenario — included for visibility;
+        #        a rejected order may legitimately have no Converge record —
+        #        it will also appear in the Logs sheet for tracking).
+        # SHIPPED orders that are not in Converge settled belong in Section 4
+        #   (ASN_NOT_SETTLED / SHIPPED_NOT_SETTLED) — NOT here.
         # Columns: Order # | Converge Status | CXP Status | Remarks
         # ══════════════════════════════════════════════════════════════════════
         r = section_hdr(r, "Orders present in CXP and not present in Converge")
         r = sub_hdr(r, ["Order #", "Converge Status", "CXP Status", "Remarks"])
 
+        _sec1_statuses = {"ORDERED", "CLAIMED", "REJECTED"}
         sec1_orders = [
             o for o in cxp_orders
-            if o.get("order_state") == "SUCCESS"
+            if o.get("fulfillment_status") in _sec1_statuses
             and o["process_number"] not in converge_invoices
             and o["process_number"] not in settled_invoices
         ]
         if sec1_orders:
             for order in sec1_orders:
-                wr(r, [
-                    order["process_number"],
-                    "NA",
-                    order.get("fulfillment_status", ""),
-                    ""
-                ])
-                self._apply_row_fill(sheet, r, 4, "FFEB9C")
+                fs     = order.get("fulfillment_status", "")
+                remark = (
+                    "REJECTED — may have no payment record; also logged in Logs sheet"
+                    if fs == "REJECTED" else ""
+                )
+                wr(r, [order["process_number"], "NA", fs, remark])
+                colour = "FFC7CE" if fs == "REJECTED" else "FFEB9C"
+                self._apply_row_fill(sheet, r, 4, colour)
                 r += 1
         else:
             r = no_issue_row(r)
@@ -446,22 +457,35 @@ class ReconciliationWorkbookWriter:
 
         # ══════════════════════════════════════════════════════════════════════
         # SECTION 4 — Orders Shipped in CXP but Converge is NOT settled
-        # Uses action_reason == "SHIPPED_NOT_SETTLED" from classifier.
+        # Catches two classifier reasons — both mean money not collected
+        # for a physically fulfilled order:
+        #
+        #   ASN_NOT_SETTLED     — warehouse shipped (ASN record exists) but
+        #                         no Converge settlement record → CRITICAL
+        #   SHIPPED_NOT_SETTLED — CXP says SHIPPED but not settled (no ASN)
+        #
         # Columns: Order # | CXP status | Converge Status | Remarks
         # ══════════════════════════════════════════════════════════════════════
         r = section_hdr(r, "Orders Shipped in CXP but converge is not settled")
         r = sub_hdr(r, ["Order #", "CXP status", "Converge Status", "Remarks"])
 
+        _sec4_reasons = {"ASN_NOT_SETTLED", "SHIPPED_NOT_SETTLED"}
         sec4_written = False
         for order in cxp_orders:
             oid         = order["process_number"]
             order_class = orders_dict.get(oid, {})
-            if order_class.get("action_reason") == "SHIPPED_NOT_SETTLED":
+            reason      = order_class.get("action_reason", "")
+            if reason in _sec4_reasons:
+                remark = (
+                    "ASN received — warehouse shipped but payment not settled"
+                    if reason == "ASN_NOT_SETTLED"
+                    else "CXP shipped — no ASN, not settled"
+                )
                 wr(r, [
                     oid,
                     order_class.get("cxp_status", "NA"),
                     order_class.get("converge_status", "NA"),
-                    ""
+                    remark
                 ])
                 self._apply_row_fill(sheet, r, 4, "FFC7CE")
                 r += 1
@@ -547,6 +571,7 @@ class ReconciliationWorkbookWriter:
             ])
             r += 1
 
+        self._apply_borders(sheet)
         self._auto_fit_columns(sheet)
 
     # ================= SHEET 6: LOGS =================
@@ -633,10 +658,24 @@ class ReconciliationWorkbookWriter:
         r = kv(r, "CURRENT — unique invoices",       cc.get("total_invoices", 0))
         r = kv(r, "CURRENT — data inconsistencies",  cc.get("data_inconsistencies", 0))
         cs = converge_settled_result.get("stats", {})
-        r = kv(r, "SETTLED — unique invoices",       cs.get("total_invoices", 0))
-        r = kv(r, "SETTLED — settled count",         cs.get("settled_count", 0))
-        r = kv(r, "SETTLED — anomaly count",         cs.get("anomaly_count", 0))
-        r = kv(r, "SETTLED — multiple SALE rows",    cs.get("multiple_sales_count", 0))
+        total_inv      = cs.get("total_invoices", 0)
+        settled_cnt    = cs.get("settled_count", 0)
+        return_only    = total_inv - settled_cnt        # invoices with RETURN but no SALE
+        anomaly_cnt    = cs.get("anomaly_count", 0)
+        multi_sale_cnt = cs.get("multiple_sales_count", 0)
+
+        r = kv(r, "SETTLED — unique invoices",
+               f"{total_inv}  (= {settled_cnt} with SALE  +  {return_only} RETURN-only)")
+        r = kv(r, "SETTLED — invoices with SALE row (settled = True)",  settled_cnt)
+        r = kv(r, "SETTLED — RETURN-only invoices (no SALE row)",       return_only)
+        r = kv(r, "SETTLED — anomaly count",    anomaly_cnt)
+        r = kv(r, "SETTLED — multiple SALE rows", multi_sale_cnt)
+        r = kv(r,
+               "What is a Settlement Anomaly?",
+               "RETURN_WITHOUT_SALE: Converge has a refund (RETURN) for this invoice "
+               "but no original SALE row — money was returned with no payment on record "
+               "in this batch. Also flags MULTIPLE_SALES (duplicate SALE rows for same "
+               "invoice) and NON_STANDARD transaction types.")
         r += 1
 
         # ── D: Classification Summary ─────────────────────────────────────────
@@ -750,9 +789,20 @@ class ReconciliationWorkbookWriter:
             sheet.cell(row=r, column=1).value = "No retry successes"
             r += 1
 
+        self._apply_borders(sheet)
         self._auto_fit_columns(sheet)
 
     # ================= HELPER METHODS =================
+    def _apply_borders(self, sheet):
+        """Apply thin border to every non-merged cell that has content."""
+        thin   = Side(style="thin")
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        for row in sheet.iter_rows():
+            for cell in row:
+                if isinstance(cell, MergedCell):
+                    continue
+                cell.border = border
+
     def _apply_header_style(self, sheet, row, col_count):
         dark_blue_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
         white_font = Font(color="FFFFFF", bold=True)
