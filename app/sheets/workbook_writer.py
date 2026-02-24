@@ -430,8 +430,17 @@ class ReconciliationWorkbookWriter:
             converge_amount = settled_amount_map.get(oid)
             if cxp_amount is not None and converge_amount is not None:
                 try:
-                    if abs(float(cxp_amount) - float(converge_amount)) > 0.01:
-                        wr(r, [oid, converge_amount, cxp_amount, ""])
+                    # difference = Converge - CXP
+                    # negative → Converge under-settled (needs to collect more)
+                    # positive → Converge over-settled (collected too much)
+                    diff_val = float(converge_amount) - float(cxp_amount)
+                    if abs(diff_val) > 0.01:
+                        sign = "+" if diff_val > 0 else ""
+                        remark = (
+                            f"Difference: {sign}{diff_val:.2f} — "
+                            "Settled amount differs from CXP order total; please verify with finance"
+                        )
+                        wr(r, [oid, converge_amount, cxp_amount, remark])
                         self._apply_row_fill(sheet, r, 4, "FFC7CE")
                         r += 1
                         sec2_written = True
@@ -557,6 +566,12 @@ class ReconciliationWorkbookWriter:
         failed_ids     = set(classification["failed_orders"])
         internal_users = {"amit.kumar@phasezeroventures.com"}
 
+        previous_failed_ids = set()
+        for oid in classification.get("retry_success_orders", []):
+            prev = orders_dict.get(oid, {}).get("previous_failed_attempt")
+            if prev:
+                previous_failed_ids.add(prev)
+
         for order in cxp_orders:
             oid   = order["process_number"]
             email = (order.get("notif_email") or "").strip().lower()
@@ -584,6 +599,12 @@ class ReconciliationWorkbookWriter:
                 conv_stat,
                 reason
             ])
+
+            sheet.cell(row=r, column=1).alignment = Alignment(horizontal="center")
+            sheet.cell(row=r, column=3).alignment = Alignment(horizontal="center")
+
+            if oid in previous_failed_ids:
+                self._apply_row_fill(sheet, r, 1, "DAEEF3")
             r += 1
 
         self._apply_borders(sheet)
@@ -613,6 +634,67 @@ class ReconciliationWorkbookWriter:
 
         orders_dict = classification.get("orders", {})
         stats       = classification.get("classification_stats", {})
+
+        # ── Pre-compute: full amount mismatch list from ASN orders ────────────
+        # This mirrors Section 2 of the Reconciliation sheet exactly so that
+        # the Logs count and detail table always match the Reconciliation sheet.
+        # The classifier's settlement_amount_mismatches only covers cxp_orders
+        # (date-window orders); here we use all ASN orders (wider scope).
+        _asn_settled_invoices = converge_settled_result.get("invoice_level", {})
+        _asn_settled_amount_map = {}
+        for _inv, _data in _asn_settled_invoices.items():
+            for _raw in _data.get("raw_rows", []):
+                if _raw.get("transaction_type") == "SALE":
+                    _asn_settled_amount_map[_inv] = _raw.get("amount")
+                    break
+
+        _asn_total_map = {}
+        _asn_order_state_map = {}
+        for _item in (order_totals or []):
+            _pnum = _item.get("process_number")
+            _tot = _item.get("order_total")
+            if _pnum and _tot is not None:
+                _asn_total_map[str(_pnum).strip()] = _tot
+        for _item in (asn_order_totals or []):
+            _pnum = _item.get("process_number")
+            _tot = _item.get("order_total")
+            _state = _item.get("order_state")
+            if _pnum:
+                _pnum = str(_pnum).strip()
+                if _tot is not None:
+                    _asn_total_map[_pnum] = _tot
+                if _state is not None:
+                    _asn_order_state_map[_pnum] = _state
+
+        full_amount_mismatches = []
+        for _oid in (asn_process_numbers or []):
+            _oid = str(_oid).strip()
+            _cxp_amt = _asn_total_map.get(_oid)
+            _conv_amt = _asn_settled_amount_map.get(_oid)
+            if _cxp_amt is not None and _conv_amt is not None:
+                try:
+                    # difference = Converge - CXP
+                    # negative → Converge under-settled (collected less than order total)
+                    # positive → Converge over-settled (collected more than order total)
+                    _diff = float(_conv_amt) - float(_cxp_amt)
+                    if abs(_diff) > 0.01:
+                        full_amount_mismatches.append({
+                            "order_id": _oid,
+                            "order_total": float(_cxp_amt),
+                            "settled_amount": float(_conv_amt),
+                            "difference": _diff
+                        })
+                except (TypeError, ValueError):
+                    pass
+
+        # IDs already flagged ACTION_REQUIRED by the classifier (date-window orders)
+        _classifier_action_ids = set(classification.get("action_required_orders", []))
+        # Extra mismatch orders from ASN scope that the classifier didn't see
+        # (ordered outside the CXP date window but shipped within it)
+        _extra_mismatch_ids = [
+            m["order_id"] for m in full_amount_mismatches
+            if m["order_id"] not in _classifier_action_ids
+        ]
 
         def wr(row, values):
             for col, val in enumerate(values, start=1):
@@ -708,16 +790,22 @@ class ReconciliationWorkbookWriter:
         r = kv(r, "Action Required — Payment Success Order Failed",
                   stats.get("payment_success_order_failed", 0))
         r = kv(r, "Action Required — Settlement Anomaly",  stats.get("settlement_anomaly", 0))
-        r = kv(r, "Action Required — Amount Mismatch",     stats.get("settlement_amount_mismatch", 0))
+        r = kv(r, "Action Required — Amount Mismatch",     len(full_amount_mismatches))
         r = kv(r, "Action Required — Settled but No ASN",  stats.get("settled_no_asn", 0))
         r = kv(r, "Retry Successes",                       len(classification.get("retry_success_orders", [])))
         r += 1
 
         # ── E: Action Required Detail ─────────────────────────────────────────
         action_ids = classification.get("action_required_orders", [])
-        r = hdr(r, f"Action Required Orders ({len(action_ids)})")
 
-        if action_ids:
+        # Augment with ASN-scope mismatches not seen by the classifier
+        # (orders placed outside the CXP date window but shipped within it)
+        augmented_action_ids = list(action_ids) + _extra_mismatch_ids
+        total_action_count   = len(augmented_action_ids)
+
+        r = hdr(r, f"Action Required Orders ({total_action_count})")
+
+        if augmented_action_ids:
             wr(r, ["Order ID", "Reason", "CXP DB Status", "CXP Status",
                    "Converge Status", "Settled", "ASN", "Order Total", "Settled Amount"])
             self._apply_sub_header_style(sheet, r, 9)
@@ -733,21 +821,42 @@ class ReconciliationWorkbookWriter:
                 "SETTLEMENT_AMOUNT_MISMATCH":   "FFC7CE",
             }
 
-            for oid in action_ids:
-                od = orders_dict.get(oid, {})
-                wr(r, [
-                    oid,
-                    od.get("action_reason", ""),
-                    od.get("cxp_db_status", ""),
-                    od.get("cxp_status", ""),
-                    od.get("converge_status", "NA"),
-                    "Yes" if od.get("is_settled") else "No",
-                    "Yes" if od.get("has_asn") else "No",
-                    od.get("order_total", ""),
-                    od.get("settled_amount", "")
-                ])
-                colour = reason_colours.get(od.get("action_reason", ""), "FFEB9C")
-                self._apply_row_fill(sheet, r, 9, colour)
+            # Build a quick lookup for extra mismatch details
+            _extra_mismatch_map = {m["order_id"]: m for m in full_amount_mismatches}
+
+            for oid in augmented_action_ids:
+                if oid in _extra_mismatch_map and oid not in _classifier_action_ids:
+                    # ASN-scope mismatch order — not in orders_dict, build from mismatch data
+                    m = _extra_mismatch_map[oid]
+                    # Get order_state from asn_order_totals (now includes order_state column)
+                    cxp_db_status = _asn_order_state_map.get(oid, "")
+                    wr(r, [
+                        oid,
+                        "SETTLEMENT_AMOUNT_MISMATCH",
+                        cxp_db_status,   # from DB via fetch_order_totals (order_state column)
+                        "SHIPPED",       # must be shipped — it's in ASN
+                        "NA",
+                        "Yes",           # settled (it's in Converge settled)
+                        "Yes",           # has ASN (that's why it's in the list)
+                        f"{m['order_total']:.2f}",
+                        f"{m['settled_amount']:.2f}"
+                    ])
+                    self._apply_row_fill(sheet, r, 9, "FFC7CE")
+                else:
+                    od = orders_dict.get(oid, {})
+                    wr(r, [
+                        oid,
+                        od.get("action_reason", ""),
+                        od.get("cxp_db_status", ""),
+                        od.get("cxp_status", ""),
+                        od.get("converge_status", "NA"),
+                        "Yes" if od.get("is_settled") else "No",
+                        "Yes" if od.get("has_asn") else "No",
+                        od.get("order_total", ""),
+                        od.get("settled_amount", "")
+                    ])
+                    colour = reason_colours.get(od.get("action_reason", ""), "FFEB9C")
+                    self._apply_row_fill(sheet, r, 9, colour)
                 r += 1
         else:
             sheet.cell(row=r, column=1).value = "✓ No orders require action"
@@ -757,7 +866,9 @@ class ReconciliationWorkbookWriter:
         r += 1
 
         # ── F: Settlement Mismatches ──────────────────────────────────────────
-        mismatches = classification.get("settlement_amount_mismatches", [])
+        # Uses the same ASN-scoped mismatch list as Reconciliation Sheet Section 2.
+        # difference = Converge - CXP:  negative = under-settled, positive = over-settled
+        mismatches = full_amount_mismatches
         r = hdr(r, f"Settlement Amount Mismatches ({len(mismatches)})")
 
         if mismatches:
@@ -765,12 +876,12 @@ class ReconciliationWorkbookWriter:
             self._apply_sub_header_style(sheet, r, 4)
             r += 1
             for m in mismatches:
-                diff_val = m["difference"]
+                diff_val = m["difference"]   # already Converge - CXP
                 sign     = "+" if diff_val > 0 else ""
                 wr(r, [
                     m["order_id"],
-                    f"{float(m['order_total']):.2f}",
-                    f"{float(m['settled_amount']):.2f}",
+                    f"{m['order_total']:.2f}",
+                    f"{m['settled_amount']:.2f}",
                     f"{sign}{diff_val:.2f}"
                 ])
                 self._apply_row_fill(sheet, r, 4, "FFC7CE")
