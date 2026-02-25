@@ -91,7 +91,7 @@ def fetch_asn_process_numbers(start_date: str, end_date: str) -> List[Dict]:
 
 
 def fetch_order_totals(process_numbers: List[str]) -> List[Dict]:
-    """Fetch order totals for specified process numbers."""
+    """Fetch order totals and order state for specified process numbers."""
     if not process_numbers:
         logger.warning("No process numbers provided")
         return []
@@ -100,7 +100,8 @@ def fetch_order_totals(process_numbers: List[str]) -> List[Dict]:
     sql = f"""
         SELECT
             process_number,
-            order_total
+            order_total,
+            order_state
         FROM pzv_aftermarket.pzv_sales_order pso
         WHERE process_number IN ({placeholders})
     """
