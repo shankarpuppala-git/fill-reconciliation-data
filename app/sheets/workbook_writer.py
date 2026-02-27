@@ -564,7 +564,8 @@ class ReconciliationWorkbookWriter:
         ])
 
         failed_ids     = set(classification["failed_orders"])
-        internal_users = {"amit.kumar@phasezeroventures.com"}
+        internal_users = {"amit.kumar@phasezeroventures.com","shankar.puppala@phasezero.ai","krishna.majeti@phasezer.ai"}
+
 
         previous_failed_ids = set()
         for oid in classification.get("retry_success_orders", []):
@@ -779,9 +780,11 @@ class ReconciliationWorkbookWriter:
         r = kv(r, "Success — Shipped + Settled",           stats.get("success_shipped_settled", 0))
         r = kv(r, "Success — Ordered/Claimed + Approved",  stats.get("success_ordered_approved", 0))
         r = kv(r, "Success — Data inconsistency (noted)",  stats.get("verification_needed", 0))
+        r = kv(r,"Rejected Order",                         stats.get("order_rejected", 0))
         r = kv(r, "Failed — Declined",                     stats.get("declined", 0))
         r = kv(r, "Failed — Fraud",                        stats.get("fraud", 0))
         r = kv(r, "Failed — Payment Cancelled",            stats.get("payment_cancelled", 0))
+        r = kv(r, "Failed — Other",                        stats.get("failed_other", 0))
         r = kv(r, "Failed — Other",                        stats.get("failed_other", 0))
         r = kv(r, "Action Required — CXP Error State",     stats.get("cxp_error_state", 0))
         r = kv(r, "Action Required — ASN Not Settled",     stats.get("asn_not_settled", 0))

@@ -49,6 +49,7 @@ def classify_orders(
 
     orders_result = {}
     successful_orders = []
+    rejected_orders = []
     failed_orders = set()
     action_required_orders = []
     retry_success_orders = []
@@ -91,7 +92,8 @@ def classify_orders(
         "success_shipped_settled": 0,
         "success_ordered_approved": 0,
         "verification_needed": 0,
-        "failed_other": 0
+        "failed_other": 0,
+        "order_rejected":0
     }
 
     # ──────────────────────────────────────────
@@ -158,6 +160,10 @@ def classify_orders(
             state = "ACTION_REQUIRED"
             action_reason = "SHIPPED_NOT_SETTLED"
             classification_stats["shipped_not_settled"] += 1
+
+        elif cxp_status == "REJECTED" and converge_status == "APPROVAL":
+            state="ORDER REJECTED"
+            classification_stats["order_rejected"] += 1
 
         # ── PRIORITY 7: Payment approved but no CXP fulfillment status
         elif not cxp_status and converge_status == "APPROVAL":
@@ -249,6 +255,9 @@ def classify_orders(
             failed_orders.add(order_id)
         elif state == "ACTION_REQUIRED":
             action_required_orders.append(order_id)
+        elif state == "REJECTES":
+            rejected_orders.append(order_id)
+
 
         if settled_no_asn:
             settled_no_asn_orders.append(order_id)
@@ -323,6 +332,7 @@ def classify_orders(
     logger.info("  - Shipped + Settled:         %s", classification_stats["success_shipped_settled"])
     logger.info("  - Ordered + Approved:        %s", classification_stats["success_ordered_approved"])
     logger.info("  - Verification (data issue): %s", classification_stats["verification_needed"])
+    logger.info("Rejected orders:               %s",classification_stats["order_rejected"])
     logger.info("Failed:                        %s", len(failed_orders))
     logger.info("  - Declined:                  %s", classification_stats["declined"])
     logger.info("  - Fraud:                     %s", classification_stats["fraud"])
@@ -374,7 +384,8 @@ def classify_orders(
         "converge_data_inconsistencies": converge_data_inconsistencies,
         "settlement_amount_mismatches": settlement_amount_mismatches,
         "settled_no_asn_orders": settled_no_asn_orders,
-        "classification_stats": classification_stats
+        "classification_stats": classification_stats,
+        "rejected_orders": rejected_orders
     }
 
 
