@@ -785,7 +785,6 @@ class ReconciliationWorkbookWriter:
         r = kv(r, "Failed — Fraud",                        stats.get("fraud", 0))
         r = kv(r, "Failed — Payment Cancelled",            stats.get("payment_cancelled", 0))
         r = kv(r, "Failed — Other",                        stats.get("failed_other", 0))
-        r = kv(r, "Failed — Other",                        stats.get("failed_other", 0))
         r = kv(r, "Action Required — CXP Error State",     stats.get("cxp_error_state", 0))
         r = kv(r, "Action Required — ASN Not Settled",     stats.get("asn_not_settled", 0))
         r = kv(r, "Action Required — Shipped Not Settled", stats.get("shipped_not_settled", 0))
